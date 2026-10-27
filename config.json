@@ -1,0 +1,27 @@
+{
+  "matrix_sheet": "Матрица решений комплаенс",
+  "matrix_header_row": 1,
+  "template_sheet_contains": "ЗАПОЛНИТЬ",
+  "template_header_scan_rows": 25,
+  "template_data_start_row": 18,
+  "prototype_row": 2,
+  "group_key": ["SP_NAME", "OPERATION_TYPE", "CLIENT_TYPE", "CHANNEL_INDICATOR", "RELATION_TYPE"],
+  "row_key": ["TRANSACTION_TYPE", "INSPECTED_PERSON", "STOP_LIST_STATUS", "MATCH_NEGATIVE_CASE", "MAX_AMOUNT"],
+  "platform_channel": "SBOL_PRO",
+  "new_row_defaults": {"IFT": null, "PROM": null, "Столбец1": null},
+  "bypass_target": "VALUE_SWITCH",
+  "bypass_values": {"пропуск контролей": null, "запрет": "ТЗ"},
+  "lookups": {
+    "CHANNEL_INDICATOR": {"sheet": "Каналы", "code_col": 1, "description_col": 2, "description_field": "CHANNEL_INDICATOR_DESCRIPTION"},
+    "SP_NAME": {"sheet": "Подсистемы", "code_col": 1, "description_col": 2, "description_field": "SP_NAME_DESCRIPTION"},
+    "SBOL_PRO_PLATFORM": {"sheet": "Платформа клиентского приложения", "code_col": 1, "description_col": 2, "description_field": "SBOL_PRO_PLATFORM_DESCRIPTION"},
+    "TRANSACTION_TYPE": {"sheet": "Типы транзакций", "code_col": 1, "description_col": 2, "description_field": "TRANSACTION_TYPE_DESCRIPTION"},
+    "OPERATION_TYPE": {"sheet": "Типы Операций", "code_col": 1, "description_col": 2, "description_field": "OPERATION_DESCRIPTION"},
+    "RELATION_TYPE": {"sheet": "Типы взаимоотношений", "code_col": 1, "description_col": 3, "description_field": "RELATION_TYPE_DESCRIPTION"},
+    "CLIENT_TYPE": {"sheet": "Типы Клиентов", "code_col": 1, "description_col": 3, "description_field": "CLIENT_TYPE_DESCRIPTION"},
+    "INSPECTED_PERSON": {"sheet": "Проверяемые лица", "code_col": 1, "description_col": 3, "description_field": "INSPECTED_PERSON_DESCRIPTION"},
+    "STOP_LIST_STATUS": {"sheet": "Статусы Стоп Листа", "code_col": 1, "description_col": 2, "description_field": "STOP_LIST_STATUS_DESCRIPTION"},
+    "MATCH_NEGATIVE_CASE": {"sheet": "Совпадение", "code_col": 1, "description_col": 2, "description_field": "MATCH_NEGATIVE_CASE_DESCRIPTION"},
+    "VALUE": {"sheet": "Решения", "code_col": 2, "description_col": 4, "description_field": "DESCRIPTION"}
+  }
+}
