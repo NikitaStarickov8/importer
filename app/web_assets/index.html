@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="matrix-token" content="__TOKEN__">
+  <title>MatrixImporter — импорт потреб</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><div class="brand"><span class="brand-icon" aria-hidden="true">M</span>MatrixImporter<span class="version">0.2</span></div><span class="local"><span aria-hidden="true"></span>На этом компьютере</span></header>
+  <main>
+    <div class="intro"><p class="eyebrow">МАТРИЦА ПРОВЕРОК</p><h1>Перенос потреб в матрицу</h1><p class="subtitle">Загрузите актуальную матрицу и заполненные шаблоны.<br class="desktop-break"> Программа добавит новые записи и обновит существующие.</p></div>
+    <section class="card" aria-labelledby="matrix-heading">
+      <div class="section-heading"><span class="step" aria-hidden="true">1</span><div><h2 id="matrix-heading">Основная матрица</h2><p>Актуальная версия Excel со всеми листами-справочниками</p></div></div>
+      <div class="file-box" id="matrix-box"><span class="file-icon" aria-hidden="true">X</span><div class="file-description"><strong id="matrix-name">Файл не выбран</strong><span id="matrix-detail">Один файл .xlsx</span></div><label class="button secondary file-button">Выбрать матрицу<input id="matrix-file" type="file" accept=".xlsx" aria-label="Выбрать основную матрицу"></label></div>
+    </section>
+    <section class="card" aria-labelledby="templates-heading">
+      <div class="section-heading"><span class="step" aria-hidden="true">2</span><div><h2 id="templates-heading">Шаблоны потреб</h2><p>Выберите один или несколько заполненных шаблонов</p></div></div>
+      <div class="file-box"><span class="file-icon" aria-hidden="true">+</span><div class="file-description"><strong id="templates-count">Шаблоны не выбраны</strong><span>Можно добавить несколько файлов за один раз</span></div><label class="button secondary file-button">Добавить шаблоны<input id="template-files" type="file" accept=".xlsx" multiple aria-label="Добавить шаблоны потреб"></label></div>
+      <ul id="file-list" class="file-list" aria-label="Выбранные шаблоны" hidden></ul>
+    </section>
+    <div class="action-row"><div><p class="action-note">Исходные файлы сохраняются без изменений.</p><p class="action-note muted">Результат будет доступен отдельным Excel-файлом.</p></div><button id="run" class="button primary" disabled>Импортировать</button></div>
+    <section id="status-panel" class="status-panel" aria-live="polite" hidden>
+      <div class="status-title-row"><h2 id="status-heading">Выполняется импорт</h2><span id="status-badge" class="badge">В работе</span></div>
+      <p id="status-message"></p><progress id="progress" aria-label="Выполнение импорта"></progress>
+      <div id="counts" class="counts" hidden><div><strong id="added">0</strong><span>Добавлено</span></div><div><strong id="updated">0</strong><span>Обновлено</span></div><div><strong id="skipped">0</strong><span>Без изменений</span></div></div>
+      <div id="download-row" class="download-row" hidden><button id="download" class="button primary">Скачать результат .xlsx</button><p>Откройте результат в Р7-Офис или Excel<br>и дождитесь пересчёта формул.</p></div>
+    </section>
+    <div class="demo-row"><div><strong>Сначала хотите проверить на примере?</strong><p>Демо использует искусственные данные из папки examples.</p></div><button id="demo" class="button quiet">Запустить демо</button></div>
+    <footer><p>IFT и PROM заполняются вручную. Байпас: «пропуск контролей» — пусто, «запрет» — ТЗ.</p><p>Файлы обрабатываются локально. Для завершения нажмите Ctrl+C в терминале.</p></footer>
+  </main>
+</body>
+</html>
