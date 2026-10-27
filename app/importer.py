@@ -194,6 +194,40 @@ TOP_CELLS = {
 }
 
 
+CELL_LINK = re.compile(
+    r"\s*=\s*(?:(?:'(?P<quoted>(?:[^']|'')+)'|(?P<plain>[^'!\[\]+*/(),;:=<>]+))!)?"
+    r"(?P<address>\$?[A-Za-z]{1,3}\$?[1-9][0-9]*)\s*"
+)
+
+
+def template_value(cell, visited=None):
+    """Читает значение или простую ссылку, не полагаясь на кэш пересчёта Excel."""
+    if cell.data_type != "f":
+        return literal(cell)
+    visited = set() if visited is None else visited
+    location = (cell.parent.title, cell.coordinate)
+    if location in visited:
+        raise ImportProblem(f"{cell.parent.title}!{cell.coordinate}: циклическая ссылка в шаблоне.")
+    if len(visited) >= 64:
+        raise ImportProblem(f"{cell.parent.title}!{cell.coordinate}: слишком длинная цепочка ссылок.")
+    match = CELL_LINK.fullmatch(cell.value) if isinstance(cell.value, str) else None
+    if match is None:
+        raise ImportProblem(f"{cell.parent.title}!{cell.coordinate}: неожиданная формула. "
+                            "Поддерживаются простые ссылки на ячейки; для вычисления этой формулы требуется отдельное правило.")
+    name = match.group("quoted")
+    if name is not None:
+        name = name.replace("''", "'")
+    elif match.group("plain") is not None:
+        name = match.group("plain").strip()
+    sheet = cell.parent if name is None else sheet_named(cell.parent.parent, name)
+    address = match.group("address").replace("$", "").upper()
+    try:
+        target = sheet[address]
+    except (ValueError, IndexError) as exc:
+        raise ImportProblem(f"{cell.parent.title}!{cell.coordinate}: недопустимая ссылка.") from exc
+    return template_value(target, visited | {location})
+
+
 def parse_template(path, catalog, config):
     book = load_workbook(path, read_only=False, data_only=False)
     try:
@@ -214,16 +248,36 @@ def parse_template(path, catalog, config):
         if missing:
             raise ImportProblem("В шаблоне отсутствуют столбцы: " + ", ".join(sorted(missing)))
         common = {}
-        for field, addresses in TOP_CELLS.items():
-            for address in addresses:
-                value = literal(sheet[address])
+
+        def common_value(field):
+            if field not in common:
+                common[field] = None
+                addresses = TOP_CELLS.get(field, ())
+                # Код в формульной D8 определяем по B8 через справочник.
+                if field == "CLIENT_TYPE" and sheet["D8"].data_type != "f":
+                    addresses = ("D8",)
+                for address in addresses:
+                    value = template_value(sheet[address])
+                    if not blank(value):
+                        common[field] = value
+                        break
+            return common[field]
+
+        def fill_common(raw):
+            for name, spec in config["lookups"].items():
+                if name == "VALUE":
+                    continue
+                description = spec["description_field"]
+                # Заполненные значения строки приоритетнее всей шапки.
+                if not blank(raw.get(name)) or not blank(raw.get(description)):
+                    continue
+                value = common_value(description)
                 if not blank(value):
-                    common[field] = value
-                    break
-        # Известную D8 вычисляем по B8 через справочник матрицы, без кэша Excel.
-        client_code = sheet["D8"]
-        if client_code.data_type != "f" and not blank(client_code.value):
-            common["CLIENT_TYPE"] = literal(client_code)
+                    raw[description] = value
+                else:
+                    value = common_value(name)
+                    if not blank(value):
+                        raw[name] = value
         result = []
         known = {header(k): k for k in config["lookups"]}
         known.update({header(v["description_field"]): v["description_field"] for k, v in config["lookups"].items() if k != "VALUE"})
@@ -237,17 +291,13 @@ def parse_template(path, catalog, config):
                 continue
             source = f"{Path(path).name}, {sheet.title}!{row}"
             try:
-                raw = {field: literal(sheet.cell(row, cols[key])) for key, field in known.items() if key in cols}
-                # Поля строки приоритетны; связанные общие коды не должны перебить их.
-                for field, val in common.items():
-                    desc = config["lookups"].get(field, {}).get("description_field")
-                    if blank(raw.get(field)) and (not desc or blank(raw.get(desc))):
-                        raw[field] = val
-                raw["VALUE"] = literal(sheet.cell(row, value_col))
+                raw = {field: template_value(sheet.cell(row, cols[key])) for key, field in known.items() if key in cols}
+                fill_common(raw)
+                raw["VALUE"] = template_value(sheet.cell(row, value_col))
                 raw["TITLE_FOR_CLIENT"] = raw.get("TITLE_FOR_CLIENT")
                 raw["TEXT_FOR_CLIENT"] = raw.get("TEXT_FOR_CLIENT")
                 if bypass_col:
-                    bypass = literal(sheet.cell(row, bypass_col))
+                    bypass = template_value(sheet.cell(row, bypass_col))
                     mapping = {norm(k): v for k, v in config["bypass_values"].items()}
                     if blank(bypass):
                         raw[config["bypass_target"]] = None

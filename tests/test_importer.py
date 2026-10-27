@@ -223,6 +223,93 @@ class ImportTests(unittest.TestCase):
             self.run_import(matrix=matrix)
         self.assertFalse(self.output.exists())
 
+    def test_top_d3_to_d6_are_simple_links_and_not_needed_by_complete_rows(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            for row in range(3, 7):
+                sheet[f'D{row}'] = f'=B{row}'
+        template = self.change(self.templates[0], edit, 'top_links.xlsx')
+        result = self.run_import(templates=[template])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_unneeded_complex_header_formula_is_not_evaluated(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            for address in ['D3','D4','D5','D6','D7','B8','D10']:
+                sheet[address] = '=UNSUPPORTED_FUNCTION(123)'
+        template = self.change(self.templates[0], edit, 'unused_header.xlsx')
+        result = self.run_import(templates=[template])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_row_references_follow_header_links_without_cached_results(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            for row in range(3, 8):
+                sheet[f'D{row}'] = f'=$B${row}'
+            # В строке передаём коды из D5/D7; остальные описания идут из шапки.
+            for row in range(18, 21):
+                for column, address in [('A','D3'),('B','D5'),('C','D7'),('D','B10'),('H','B8')]:
+                    sheet[f'{column}{row}'] = f'=${address[0]}${address[1:]}'
+        template = self.change(self.templates[0], edit, 'row_links.xlsx')
+        result = self.run_import(templates=[template])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_missing_row_values_are_taken_from_linked_header(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            for row in range(3, 8):
+                sheet[f'D{row}'] = f'=B{row}'
+            for row in range(18, 21):
+                for col in (1, 2, 3, 4, 8):
+                    sheet.cell(row, col).value = None
+        template = self.change(self.templates[0], edit, 'header_fallback.xlsx')
+        result = self.run_import(templates=[template])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_quoted_sheet_reference_and_apostrophe(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            helper = book.create_sheet("Общие 'поля'")
+            helper['B3'] = 'СБОЛ про'
+            sheet['D3'] = "='Общие ''поля'''!$B$3"
+            for row in range(18, 21):
+                sheet[f'A{row}'] = '=$D$3'
+        template = self.change(self.templates[0], edit, 'quoted_links.xlsx')
+        result = self.run_import(templates=[template])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_formula_link_cycle_is_rejected(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            sheet['D3'], sheet['B3'] = '=B3', '=D3'
+            sheet['A18'] = '=D3'
+        template = self.change(self.templates[0], edit, 'cycle.xlsx')
+        with self.assertRaisesRegex(ImportProblem, 'циклическая ссылка'):
+            self.run_import(templates=[template])
+        self.assertFalse(self.output.exists())
+
+    def test_blank_link_can_fall_back_to_common_value(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            sheet['A18'] = '=$F$2'
+            sheet['D3'] = '=B3'
+        template = self.change(self.templates[0], edit, 'blank_link.xlsx')
+        result = self.run_import(templates=[template])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_linked_text_preserves_newlines_and_equals_literal(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            sheet['F2'] = '=обычный текст\nВторая строка'
+            sheet['F2'].data_type = 's'
+            sheet['P18'] = '=$F$2'
+        template = self.change(self.templates[0], edit, 'linked_text.xlsx')
+        self.run_import(templates=[template])
+        book = load_workbook(self.output)
+        self.assertEqual(book.worksheets[0]['AK2'].value, '=обычный текст\nВторая строка')
+        self.assertEqual(book.worksheets[0]['AK2'].data_type, 's')
+        book.close()
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
