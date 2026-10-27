@@ -43,6 +43,28 @@ def formula(value):
     return isinstance(value, str) and value.startswith("=")
 
 
+def configured_aliases(config):
+    aliases = config.get("aliases", {})
+    if not isinstance(aliases, dict):
+        raise ImportProblem("Настройка aliases должна быть объектом с именами полей.")
+    result = {}
+    for name, mapping in aliases.items():
+        if name not in config["lookups"]:
+            raise ImportProblem(f"aliases: неизвестное поле {name}. Используйте имя из lookups, например STOP_LIST_STATUS.")
+        if not isinstance(mapping, dict):
+            raise ImportProblem(f"aliases.{name}: требуется объект «название в шаблоне»: «код в матрице».")
+        values = {}
+        for source, target in mapping.items():
+            if not isinstance(source, str) or blank(source) or not isinstance(target, str) or blank(target):
+                raise ImportProblem(f"aliases.{name}: название и целевой код должны быть непустыми строками.")
+            key = norm(source)
+            if key in values and norm(values[key]) != norm(target):
+                raise ImportProblem(f"aliases.{name}: для «{source}» заданы разные коды с учётом регистра и пробелов.")
+            values[key] = target
+        result[name] = values
+    return result
+
+
 def load_config(path=None):
     with open(path or ROOT / "config.json", encoding="utf-8") as stream:
         config = json.load(stream)
@@ -51,6 +73,7 @@ def load_config(path=None):
         raise ImportProblem("В настройке ключа повторяется одно из полей.")
     if any(name in keys for name in ("IFT", "PROM", "VALUE", "TEXT_FOR_CLIENT")):
         raise ImportProblem("Результаты решения и IFT/PROM нельзя включать в ключ записи.")
+    configured_aliases(config)
     return config
 
 
@@ -99,6 +122,7 @@ class Catalog:
         self.invalid_aliases = {}
         self.issues = {}
         self.catalog_locations = {}
+        self.aliases = configured_aliases(config)
         self.cache = {}
 
     def _build_index(self, name):
@@ -141,10 +165,7 @@ class Catalog:
         self.issues[name] = issues
         self.catalog_locations[name] = (sheet.title, get_column_letter(spec["code_col"]), get_column_letter(spec["description_col"]))
 
-    def resolve(self, name, value):
-        cache_key = (name, norm(value))
-        if cache_key in self.cache:
-            return self.cache[cache_key]
+    def _resolve_direct(self, name, value):
         if name not in self.indices:
             self._build_index(name)
         title, code_col, desc_col = self.catalog_locations[name]
@@ -160,7 +181,29 @@ class Catalog:
                 details = " Неполные/непрочитанные строки, которые можно проверить: " + "; ".join(self.issues[name][:3]) + "."
             raise ImportProblem(f"{name}: значение «{value}» {reason} в основной матрице, справочник «{title}» "
                                 f"(код — столбец {code_col}, описание — {desc_col}).{details}")
-        entry = next(iter(candidates))
+        return next(iter(candidates))
+
+    def resolve(self, name, value):
+        cache_key = (name, norm(value))
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        target = self.aliases.get(name, {}).get(norm(value))
+        if target is None:
+            entry = self._resolve_direct(name, value)
+        else:
+            try:
+                entry = self._resolve_direct(name, target)
+            except ImportProblem as exc:
+                raise ImportProblem(f"aliases.{name}: соответствие «{value}» → «{target}» не удалось применить. {exc}") from exc
+            if norm(entry.code) != norm(target):
+                raise ImportProblem(f"aliases.{name}: «{target}» — описание, а требуется технический код из основной матрицы.")
+            # Существующий однозначный код/описание нельзя незаметно переназначить.
+            original = self.indices[name].get(norm(value), set())
+            if original and original != {entry}:
+                raise ImportProblem(f"aliases.{name}: соответствие «{value}» → «{target}» конфликтует с записью основной матрицы.")
+            invalid = self.invalid_aliases[name].get(norm(value), [])
+            if invalid:
+                raise ImportProblem(f"aliases.{name}: для исходного значения «{value}» есть неполная запись основной матрицы: {invalid[0]}.")
         self.cache[cache_key] = entry
         return entry
 

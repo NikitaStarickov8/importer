@@ -1,4 +1,4 @@
-MatrixImporter 0.2.2 — запуск на Linux без Tkinter
+MatrixImporter 0.2.3 — запуск на Linux без Tkinter
 
 1. Распакуйте весь архив в новую папку.
 2. Откройте терминал в папке, где находится run.py.

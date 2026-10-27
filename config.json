@@ -11,6 +11,11 @@
   "new_row_defaults": {"IFT": null, "PROM": null, "Столбец1": null},
   "bypass_target": "VALUE_SWITCH",
   "bypass_values": {"пропуск контролей": null, "запрет": "ТЗ"},
+  "aliases": {
+    "STOP_LIST_STATUS": {
+      "Флаг 66": "MARKER_66"
+    }
+  },
   "lookups": {
     "CHANNEL_INDICATOR": {"sheet": "Каналы", "code_col": 1, "description_col": 2, "description_field": "CHANNEL_INDICATOR_DESCRIPTION"},
     "SP_NAME": {"sheet": "Подсистемы", "code_col": 1, "description_col": 2, "description_field": "SP_NAME_DESCRIPTION"},

@@ -12,7 +12,7 @@ sys.path[:0] = [str(ROOT / "vendor"), str(ROOT)]
 from openpyxl import load_workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.worksheet.datavalidation import DataValidation
-from app.importer import ImportProblem, import_files, load_config
+from app.importer import Catalog, ImportProblem, import_files, load_config
 
 warnings.filterwarnings("ignore", message="Title is more than 31 characters")
 
@@ -404,6 +404,104 @@ class ImportTests(unittest.TestCase):
         matrix = self.change(self.matrix, lambda b: setattr(b['Типы Клиентов']['A2'], 'value', None), 'main_matrix_bad_catalog.xlsx')
         with self.assertRaisesRegex(ImportProblem, 'основной матрице.*Типы Клиентов'):
             self.run_import(matrix=matrix, templates=[self.templates[0]])
+
+    def marker_files(self, label='Флаг 66'):
+        def edit_matrix(book):
+            sheet = book['Статусы Стоп Листа']
+            sheet['A5'], sheet['B5'], sheet['C5'] = 'MARKER_66', 'Маркер 66', 'NORMAL'
+            sheet = book['COMPLIANCE_STOP_LIST_CODES']
+            sheet['A5'], sheet['B5'] = 'MARKER_66', 'Маркер 66'
+        matrix = self.change(self.matrix, edit_matrix, 'marker_matrix.xlsx')
+        template = self.change(self.templates[0], lambda b: setattr(b.worksheets[0]['J20'], 'value', label), 'marker_template.xlsx')
+        return matrix, template
+
+    def alias_config(self, aliases):
+        config = load_config()
+        config['aliases'] = aliases
+        path = self.folder / 'aliases.json'
+        path.write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
+        return path
+
+    def test_flag_66_alias_writes_actual_description_and_is_idempotent(self):
+        matrix, template = self.marker_files()
+        result = self.run_import(matrix=matrix, templates=[template])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+        book = load_workbook(self.output)
+        self.assertEqual(book.worksheets[0]['Z6'].value, 'Маркер 66')
+        self.assertIn('MATCH(Z6,', book.worksheets[0]['AA6'].value)
+        self.assertEqual(book['Статусы Стоп Листа']['A5'].value, 'MARKER_66')
+        book.close()
+        again = self.run_import(matrix=self.output, templates=[template], output=self.folder/'again.xlsx')
+        self.assertEqual((again.added, again.updated, again.skipped), (0, 0, 3))
+
+    def test_alias_matches_case_and_nonbreaking_spaces(self):
+        matrix, template = self.marker_files('  ФЛАГ\xa066  ')
+        result = self.run_import(matrix=matrix, templates=[template])
+        self.assertEqual(result.added, 1)
+
+    def test_alias_is_scoped_to_lookup_field(self):
+        matrix, _ = self.marker_files()
+        book = load_workbook(matrix)
+        try:
+            book['Подсистемы']['B2'] = 'Флаг 66'
+            catalog = Catalog(book, load_config())
+            self.assertEqual(catalog.resolve('SP_NAME', 'Флаг 66').code, 'DEMO_LOAN')
+            self.assertEqual(catalog.resolve('STOP_LIST_STATUS', 'Флаг 66').code, 'MARKER_66')
+        finally:
+            book.close()
+
+    def test_alias_does_not_replace_client_message_text(self):
+        matrix, template = self.marker_files()
+        template = self.change(template, lambda b: setattr(b.worksheets[0]['P20'], 'value', 'Проверьте Флаг 66'), 'literal_alias_text.xlsx')
+        self.run_import(matrix=matrix, templates=[template])
+        book = load_workbook(self.output)
+        self.assertEqual(book.worksheets[0]['AK6'].value, 'Проверьте Флаг 66')
+        book.close()
+
+    def test_alias_missing_target_is_an_explicit_configuration_error(self):
+        matrix, template = self.marker_files()
+        config = self.alias_config({'STOP_LIST_STATUS':{'Флаг 66':'MISSING_66'}})
+        with self.assertRaisesRegex(ImportProblem, 'aliases.STOP_LIST_STATUS.*MISSING_66'):
+            self.run_import(matrix=matrix, templates=[template], config_path=config)
+        self.assertFalse(self.output.exists())
+
+    def test_alias_target_must_be_actual_code(self):
+        matrix, template = self.marker_files()
+        config = self.alias_config({'STOP_LIST_STATUS':{'Флаг 66':'Маркер 66'}})
+        with self.assertRaisesRegex(ImportProblem, 'технический код'):
+            self.run_import(matrix=matrix, templates=[template], config_path=config)
+
+    def test_alias_cannot_override_existing_different_lookup(self):
+        matrix, template = self.marker_files()
+        config = self.alias_config({'STOP_LIST_STATUS':{'В стоп-листе не найден':'MARKER_66'}})
+        with self.assertRaisesRegex(ImportProblem, 'конфликтует'):
+            self.run_import(matrix=matrix, templates=[template], config_path=config)
+
+    def test_alias_cannot_hide_ambiguous_target_code(self):
+        matrix, template = self.marker_files()
+        matrix = self.change(matrix, lambda b: b['Статусы Стоп Листа'].append(['MARKER_66','Другое описание','NORMAL']), 'ambiguous_marker.xlsx')
+        with self.assertRaisesRegex(ImportProblem, 'нескольким записям'):
+            self.run_import(matrix=matrix, templates=[template])
+        self.assertFalse(self.output.exists())
+
+    def test_alias_setting_is_optional_for_older_configs(self):
+        config = load_config()
+        del config['aliases']
+        path = self.folder/'old_config.json'
+        path.write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
+        result = self.run_import(templates=[self.templates[0]], config_path=path)
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_invalid_alias_config_is_rejected_before_import(self):
+        cases = [None, {'STOP_LIST_STATUS':['Флаг 66','MARKER_66']}, {'UNKNOWN_FIELD':{}},
+                 {'STOP_LIST_STATUS':{'Флаг 66':''}},
+                 {'STOP_LIST_STATUS':{'Флаг 66':'MARKER_66','ФЛАГ 66':'OTHER'}}]
+        for aliases in cases:
+            with self.subTest(aliases=aliases):
+                config = self.alias_config(aliases)
+                with self.assertRaisesRegex(ImportProblem, 'aliases'):
+                    self.run_import(config_path=config)
+        self.assertFalse(self.output.exists())
 
 
 if __name__ == '__main__':
