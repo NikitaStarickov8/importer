@@ -93,7 +93,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.json_request('POST',f'/api/jobs/{ident}/start',{})[0],202)
         job = self.wait(ident)
         self.assertEqual(job['state'],'done',job)
-        self.assertEqual(job['counts'],{'added':3,'updated':1,'skipped':1,'total':5})
+        self.assertEqual(job['counts'],{'added':3,'updated':1,'skipped':1,'conflicted':0,'total':5})
+        self.assertEqual(job['conflicts'], [])
         code, payload, headers = self.request('GET',job['download_url'])
         self.assertEqual(code,200)
         self.assertIn('attachment',headers['Content-Disposition'])
@@ -104,7 +105,7 @@ class WebTests(unittest.TestCase):
         workbook.close()
         second = self.create(matrix=payload)
         self.json_request('POST',f'/api/jobs/{second}/start',{})
-        self.assertEqual(self.wait(second)['counts'],{'added':0,'updated':0,'skipped':5,'total':5})
+        self.assertEqual(self.wait(second)['counts'],{'added':0,'updated':0,'skipped':5,'conflicted':0,'total':5})
         self.assertEqual(hashlib.sha256(self.matrix.read_bytes()).hexdigest(),original)
 
     def test_demo(self):
@@ -113,6 +114,28 @@ class WebTests(unittest.TestCase):
         self.assertEqual(code,202)
         job = self.wait(response['id'])
         self.assertEqual(job['counts']['added'],3)
+
+    def test_partial_result_has_conflict_details_and_can_be_downloaded(self):
+        book = load_workbook(self.matrix)
+        sheet = book.worksheets[0]
+        sheet.append([c.value for c in sheet[2]])
+        original = [c.value for c in sheet[2]]
+        data = io.BytesIO()
+        book.save(data)
+        book.close()
+        ident = self.create(matrix=data.getvalue())
+        self.json_request('POST', f'/api/jobs/{ident}/start', {})
+        job = self.wait(ident)
+        self.assertEqual(job['state'], 'done', job)
+        self.assertEqual(job['counts'], {'added':3, 'updated':0, 'skipped':1, 'conflicted':1, 'total':5})
+        self.assertEqual(len(job['conflicts']), 1)
+        self.assertIn('[2, 6]', job['conflicts'][0])
+        code, payload, _ = self.request('GET', job['download_url'])
+        self.assertEqual(code, 200)
+        result = load_workbook(io.BytesIO(payload))
+        self.assertEqual([c.value for c in result.worksheets[0][2]], original)
+        self.assertEqual(result.worksheets[0].max_row, 9)
+        result.close()
 
     def test_api_requires_token(self):
         self.assertEqual(self.request('GET','/api/info',token=False)[0],403)

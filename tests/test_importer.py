@@ -12,7 +12,7 @@ sys.path[:0] = [str(ROOT / "vendor"), str(ROOT)]
 from openpyxl import load_workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.worksheet.datavalidation import DataValidation
-from app.importer import Catalog, ImportProblem, import_files, load_config
+from app.importer import Catalog, ImportProblem, columns_at, import_files, load_config, read_matrix_row
 
 warnings.filterwarnings("ignore", message="Title is more than 31 characters")
 
@@ -88,19 +88,33 @@ class ImportTests(unittest.TestCase):
             s = book.worksheets[0]
             s.append([c.value for c in s[2]])
         bad = self.change(self.matrix, duplicate, 'duplicates.xlsx')
-        with self.assertRaisesRegex(ImportProblem, 'несколько подходящих'):
-            self.run_import(matrix=bad)
-        self.assertFalse(self.output.exists())
+        result = self.run_import(matrix=bad)
+        self.assertEqual((result.added, result.updated, result.skipped), (3, 0, 1))
+        self.assertEqual(len(result.conflicts), 1)
+        self.assertIn('несколько подходящих строк: [2, 6]', result.conflicts[0])
+        before, after = load_workbook(bad), load_workbook(self.output)
+        try:
+            for row in (2, 6):
+                self.assertEqual([c.value for c in before.worksheets[0][row]], [c.value for c in after.worksheets[0][row]])
+            self.assertEqual(after.worksheets[0].max_row, 9)
+        finally:
+            before.close()
+            after.close()
 
     def test_duplicate_templates_are_skipped(self):
         result = self.run_import(templates=[*self.templates, self.templates[0]])
         self.assertEqual((result.added, result.updated, result.skipped), (3, 1, 4))
 
-    def test_conflicting_templates_stop_before_save(self):
+    def test_conflicting_templates_skip_every_variant_and_save_other_rows(self):
         bad = self.change(self.templates[0], lambda b: setattr(b.worksheets[0]['P18'], 'value', 'Конфликтующее сообщение'), 'conflict.xlsx')
-        with self.assertRaisesRegex(ImportProblem, 'Конфликт шаблонов'):
-            self.run_import(templates=[self.templates[0], bad])
-        self.assertFalse(self.output.exists())
+        result = self.run_import(templates=[*self.templates, bad])
+        self.assertEqual((result.added, result.updated, result.skipped), (3, 0, 3))
+        self.assertEqual(len(result.conflicts), 2)
+        self.assertTrue(all('конфликт шаблонов' in message for message in result.conflicts))
+        before, after = load_workbook(self.matrix), load_workbook(self.output)
+        self.assertEqual(before.worksheets[0]['AK2'].value, after.worksheets[0]['AK2'].value)
+        before.close()
+        after.close()
 
     def test_unknown_bypass(self):
         bad = self.change(self.templates[0], lambda b: setattr(b.worksheets[0]['Q18'], 'value', 'неизвестно'), 'bypass.xlsx')
@@ -181,10 +195,123 @@ class ImportTests(unittest.TestCase):
             self.run_import()
         self.assertEqual(self.output.read_bytes(), b'existing content')
 
-    def test_duplicate_catalog_descriptions_rejected(self):
+    def test_ambiguous_template_description_is_reported_per_row(self):
         bad = self.change(self.matrix, lambda b: b['Каналы'].append(['SECOND_CODE', 'СБОЛ про']), 'bad_catalog.xlsx')
-        with self.assertRaisesRegex(ImportProblem, 'нескольким записям'):
-            self.run_import(matrix=bad)
+        result = self.run_import(matrix=bad)
+        self.assertEqual((result.added, result.updated, result.skipped, result.total), (0, 0, 0, 5))
+        self.assertEqual(len(result.conflicts), 5)
+        self.assertTrue(all('нескольким записям' in message for message in result.conflicts))
+        before, after = load_workbook(bad), load_workbook(self.output)
+        for a, b in zip(before, after):
+            self.assertEqual(list(a.values), list(b.values))
+        before.close()
+        after.close()
+
+    def test_unrelated_ambiguous_matrix_subsystem_does_not_block_import(self):
+        def edit(book):
+            book['Подсистемы'].append(['CARD_ONE', 'Кредитные карты'])
+            book['Подсистемы'].append(['CARD_TWO', 'Кредитные карты'])
+            sheet = book.worksheets[0]
+            sheet.append([c.value for c in sheet[2]])
+            sheet['G6'] = 'Кредитные карты'
+        matrix = self.change(self.matrix, edit, 'cards.xlsx')
+        result = self.run_import(matrix=matrix)
+        self.assertEqual((result.added, result.updated, result.skipped), (3, 1, 1))
+        self.assertEqual(result.conflicts, [])
+        before, after = load_workbook(matrix), load_workbook(self.output)
+        self.assertEqual([c.value for c in before.worksheets[0][6]], [c.value for c in after.worksheets[0][6]])
+        self.assertEqual(after.worksheets[0].max_row, 9)
+        before.close()
+        after.close()
+
+    def test_unclear_matrix_row_blocks_only_possible_matching_template_row(self):
+        # У формулы SP_NAME нет кэша, а описание старой строки неизвестно.
+        matrix = self.change(self.matrix, lambda b: setattr(b.worksheets[0]['G2'], 'value', 'Старое неизвестное название'), 'unclear.xlsx')
+        result = self.run_import(matrix=matrix)
+        self.assertEqual((result.added, result.updated, result.skipped), (3, 0, 1))
+        self.assertEqual(len(result.conflicts), 1)
+        self.assertIn('неразобранными строками матрицы: 2', result.conflicts[0])
+        self.assertIn('!18', result.conflicts[0])
+        before, after = load_workbook(matrix), load_workbook(self.output)
+        self.assertEqual([c.value for c in before.worksheets[0][2]], [c.value for c in after.worksheets[0][2]])
+        before.close()
+        after.close()
+
+    def test_ambiguous_other_stop_code_does_not_block_same_group(self):
+        def edit(book):
+            book['Статусы Стоп Листа'].append(['OTHER_ONE', 'Другой стопкод'])
+            book['Статусы Стоп Листа'].append(['OTHER_TWO', 'Другой стопкод'])
+            sheet = book.worksheets[0]
+            sheet.append([c.value for c in sheet[2]])
+            sheet['Z6'] = 'Другой стопкод'
+        matrix = self.change(self.matrix, edit, 'other_stop.xlsx')
+        result = self.run_import(matrix=matrix)
+        self.assertEqual((result.added, result.updated, result.skipped), (3, 1, 1))
+        self.assertFalse(result.conflicts)
+
+    def test_unused_existing_duplicate_rows_are_untouched(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            sheet.append([c.value for c in sheet[4]])
+        matrix = self.change(self.matrix, edit, 'unused_duplicate.xlsx')
+        result = self.run_import(matrix=matrix, templates=[self.templates[0]])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+        self.assertEqual(result.conflicts, [])
+        before, after = load_workbook(matrix), load_workbook(self.output)
+        for row in (4, 6):
+            self.assertEqual([c.value for c in before.worksheets[0][row]], [c.value for c in after.worksheets[0][row]])
+        before.close()
+        after.close()
+
+    def test_ambiguous_stop_code_only_skips_affected_template_row(self):
+        matrix = self.change(self.matrix, lambda b: b['Статусы Стоп Листа'].append(['REVIEW_OTHER', '02 — Тестовая проверка']), 'ambiguous_stop.xlsx')
+        result = self.run_import(matrix=matrix)
+        self.assertEqual((result.added, result.updated, result.skipped), (2, 1, 1))
+        self.assertEqual(len(result.conflicts), 1)
+        self.assertIn('!20', result.conflicts[0])
+        self.assertEqual(result.total, result.added + result.updated + result.skipped + len(result.conflicts))
+
+    def test_known_technical_code_disambiguates_description(self):
+        book = load_workbook(self.matrix)
+        try:
+            book['Подсистемы'].append(['OTHER_LOAN', 'Демонстрационная подсистема'])
+            config = load_config()
+            catalog = Catalog(book, config)
+            # Явный код вместо формулы позволяет уточнить одинаковые описания.
+            book.worksheets[0]['H2'] = 'DEMO_LOAN'
+            record = read_matrix_row(book.worksheets[0], columns_at(book.worksheets[0], 1), 2, catalog, config)
+            self.assertEqual(record.values['SP_NAME'], 'DEMO_LOAN')
+            with self.assertRaisesRegex(ImportProblem, 'нескольким записям'):
+                catalog.resolve('SP_NAME', 'Демонстрационная подсистема')
+        finally:
+            book.close()
+
+    def test_repeat_with_conflict_does_not_add_duplicates(self):
+        matrix = self.change(self.matrix, lambda b: b.worksheets[0].append([c.value for c in b.worksheets[0][2]]), 'duplicates_again.xlsx')
+        self.run_import(matrix=matrix)
+        result = self.run_import(matrix=self.output, output=self.folder / 'repeat_conflicts.xlsx')
+        self.assertEqual((result.added, result.updated, result.skipped), (0, 0, 4))
+        self.assertEqual(len(result.conflicts), 1)
+
+    def test_known_template_code_cannot_produce_ambiguous_formula_result(self):
+        matrix = self.change(self.matrix, lambda b: b['Подсистемы'].append(['OTHER_LOAN', 'Демонстрационная подсистема']), 'ambiguous_loan.xlsx')
+        result = self.run_import(matrix=matrix)
+        # В шаблонах задан DEMO_LOAN, но описание для INDEX/MATCH не уникально.
+        self.assertEqual((result.added, result.updated, result.skipped), (0, 0, 0))
+        self.assertEqual(len(result.conflicts), 5)
+        self.assertTrue(all('формульный код' in message for message in result.conflicts))
+
+    def test_unclear_formula_key_is_not_treated_as_empty(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            sheet.append([c.value for c in sheet[2]])
+            sheet['G6'] = 'Неизвестная подсистема'
+            sheet['AH6'] = '=0'
+        matrix = self.change(self.matrix, edit, 'unclear_amount.xlsx')
+        template = self.change(self.templates[0], lambda b: setattr(b.worksheets[0]['N18'], 'value', 0), 'amount_zero.xlsx')
+        result = self.run_import(matrix=matrix, templates=[template])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 0, 1))
+        self.assertEqual(len(result.conflicts), 1)
 
     def test_extend_validations_and_conditional_formatting(self):
         def edit(book):

@@ -129,9 +129,10 @@ def start(config_path=None):
                 for control in controls:
                     control.configure(state="normal")
                 if kind == "done":
-                    text = f"Добавлено: {value.added}. Обновлено: {value.updated}. Без изменений: {value.skipped}."
+                    text = f"Добавлено: {value.added}. Обновлено: {value.updated}. Без изменений: {value.skipped}. На ручной разбор: {len(value.conflicts)}."
                     status.set(text)
-                    messagebox.showinfo("Готово", f"{text}\n\nСохранено:\n{value.output}")
+                    details = "\n\n".join(value.conflicts)
+                    messagebox.showinfo("Готово", f"{text}\n\nСохранено:\n{value.output}\n\n{details}")
                 else:
                     status.set("Импорт остановлен. Выходной файл не сохранён.")
                     messagebox.showerror("Не удалось выполнить импорт", value)

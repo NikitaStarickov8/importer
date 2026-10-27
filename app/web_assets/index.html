@@ -10,7 +10,7 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header class="topbar"><div class="brand"><span class="brand-icon" aria-hidden="true">M</span>MatrixImporter<span class="version">0.2.3</span></div><span class="local"><span aria-hidden="true"></span>На этом компьютере</span></header>
+  <header class="topbar"><div class="brand"><span class="brand-icon" aria-hidden="true">M</span>MatrixImporter<span class="version">0.2.4</span></div><span class="local"><span aria-hidden="true"></span>На этом компьютере</span></header>
   <main>
     <div class="intro"><p class="eyebrow">МАТРИЦА ПРОВЕРОК</p><h1>Перенос потреб в матрицу</h1><p class="subtitle">Загрузите актуальную матрицу и заполненные шаблоны.<br class="desktop-break"> Программа добавит новые записи и обновит существующие.</p></div>
     <section class="card" aria-labelledby="matrix-heading">
@@ -26,7 +26,8 @@
     <section id="status-panel" class="status-panel" aria-live="polite" hidden>
       <div class="status-title-row"><h2 id="status-heading">Выполняется импорт</h2><span id="status-badge" class="badge">В работе</span></div>
       <p id="status-message"></p><progress id="progress" aria-label="Выполнение импорта"></progress>
-      <div id="counts" class="counts" hidden><div><strong id="added">0</strong><span>Добавлено</span></div><div><strong id="updated">0</strong><span>Обновлено</span></div><div><strong id="skipped">0</strong><span>Без изменений</span></div></div>
+      <div id="counts" class="counts" hidden><div><strong id="added">0</strong><span>Добавлено</span></div><div><strong id="updated">0</strong><span>Обновлено</span></div><div><strong id="skipped">0</strong><span>Без изменений</span></div><div><strong id="conflicted">0</strong><span>На ручной разбор</span></div></div>
+      <details id="conflicts-panel" hidden open><summary>Пропущенные строки — ручной разбор</summary><pre id="conflicts" tabindex="0"></pre></details>
       <div id="download-row" class="download-row" hidden><button id="download" class="button primary">Скачать результат .xlsx</button><p>Откройте результат в Р7-Офис или Excel<br>и дождитесь пересчёта формул.</p></div>
     </section>
     <div class="demo-row"><div><strong>Сначала хотите проверить на примере?</strong><p>Демо использует искусственные данные из папки examples.</p></div><button id="demo" class="button quiet">Запустить демо</button></div>

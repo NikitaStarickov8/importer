@@ -7,7 +7,7 @@ import re
 import tempfile
 from collections import defaultdict
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
@@ -23,6 +23,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 class ImportProblem(Exception):
     """Понятная пользователю ошибка; выходной файл не создаётся."""
+
+
+class AmbiguousLookup(ImportProblem):
+    """Несколько соответствий: строка требует ручного разбора."""
 
 
 def norm(value):
@@ -179,7 +183,8 @@ class Catalog:
             details = ""
             if not candidates and self.issues[name]:
                 details = " Неполные/непрочитанные строки, которые можно проверить: " + "; ".join(self.issues[name][:3]) + "."
-            raise ImportProblem(f"{name}: значение «{value}» {reason} в основной матрице, справочник «{title}» "
+            error = AmbiguousLookup if candidates else ImportProblem
+            raise error(f"{name}: значение «{value}» {reason} в основной матрице, справочник «{title}» "
                                 f"(код — столбец {code_col}, описание — {desc_col}).{details}")
         return next(iter(candidates))
 
@@ -206,6 +211,30 @@ class Catalog:
                 raise ImportProblem(f"aliases.{name}: для исходного значения «{value}» есть неполная запись основной матрицы: {invalid[0]}.")
         self.cache[cache_key] = entry
         return entry
+
+    def accepts(self, name, value, entry):
+        """Известный код может уточнить неоднозначное описание, но не заменить его."""
+        if norm(value) in self.aliases.get(name, {}):
+            return self.resolve(name, value) == entry
+        if name not in self.indices:
+            self._build_index(name)
+        if self.invalid_aliases[name].get(norm(value)):
+            self._resolve_direct(name, value)  # Точная диагностика неполной записи.
+        return entry in self.indices[name].get(norm(value), set())
+
+    def possible_codes(self, name, value):
+        """None — неизвестное соответствие; его нельзя исключать при поиске конфликтов."""
+        try:
+            if norm(value) in self.aliases.get(name, {}):
+                return {norm(self.resolve(name, value).code)}
+            if name not in self.indices:
+                self._build_index(name)
+            if self.invalid_aliases[name].get(norm(value)):
+                return None
+            entries = self.indices[name].get(norm(value), set())
+            return {norm(entry.code) for entry in entries} or None
+        except ImportProblem:
+            return None
 
 
 def amount(value):
@@ -254,8 +283,12 @@ def canonical(raw, catalog, config, source, require_payload=True):
             continue
         entry = catalog.resolve(name, value)
         if not blank(code_value) and not blank(desc_value):
-            if catalog.resolve(name, desc_value) != entry:
+            if not catalog.accepts(name, desc_value, entry):
                 raise ImportProblem(f"{name}: код «{code_value}» не соответствует описанию «{desc_value}».")
+        if require_payload and name != "VALUE" and len(catalog.indices[name].get(norm(entry.description), set())) > 1:
+            # При записи описания сохранённая Excel-формула могла бы выбрать
+            # другой код. Явный входной код не делает такую запись безопасной.
+            raise AmbiguousLookup(f"{name}: описание «{entry.description}» соответствует нескольким записям справочника основной матрицы; формульный код нельзя гарантировать.")
         values[name] = entry.code
         values[description] = entry.description
     if norm(values.get("CHANNEL_INDICATOR")) == norm(config["platform_channel"]) and blank(values.get("SBOL_PRO_PLATFORM")):
@@ -310,7 +343,7 @@ def template_value(cell, visited=None):
     return template_value(target, visited | {location})
 
 
-def parse_template(path, catalog, config):
+def parse_template(path, catalog, config, conflicts=None):
     book = load_workbook(path, read_only=False, data_only=False)
     try:
         matches = [s for s in book if norm(config["template_sheet_contains"]) in norm(s.title)]
@@ -361,6 +394,7 @@ def parse_template(path, catalog, config):
                     if not blank(value):
                         raw[name] = value
         result = []
+        row_count = 0
         known = {header(k): k for k in config["lookups"]}
         known.update({header(v["description_field"]): v["description_field"] for k, v in config["lookups"].items() if k != "VALUE"})
         for field in ("VALUE", "MAX_AMOUNT", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT"):
@@ -371,6 +405,7 @@ def parse_template(path, catalog, config):
             signals = [sheet.cell(row, cols[x]).value for x in marker_fields]
             if all(blank(x) for x in signals):
                 continue
+            row_count += 1
             source = f"{Path(path).name}, {sheet.title}!{row}"
             try:
                 raw = {field: template_value(sheet.cell(row, cols[key])) for key, field in known.items() if key in cols}
@@ -388,9 +423,13 @@ def parse_template(path, catalog, config):
                     else:
                         raise ImportProblem(f"Неизвестное значение поля Байпас: «{bypass}».")
                 result.append(canonical(raw, catalog, config, source))
+            except AmbiguousLookup as exc:
+                if conflicts is None:
+                    raise
+                conflicts.append(f"{source}: {exc} Строка пропущена; требуется ручной разбор.")
             except ImportProblem as exc:
                 raise ImportProblem(f"{source}: {exc}") from exc
-        if not result:
+        if not row_count:
             raise ImportProblem("В шаблоне нет строк с решениями.")
         return result
     finally:
@@ -410,6 +449,54 @@ def read_matrix_row(sheet, cols, row, catalog, config):
         elif header(field) in cols:
             raw[field] = literal(sheet.cell(row, cols[header(field)]))
     return canonical(raw, catalog, config, f"{sheet.title}!{row}", require_payload=False)
+
+
+def uncertain_constraints(sheet, cols, row, catalog, config):
+    """Возможные ключи неразобранной строки. Ошибка не считается отсутствием записи."""
+    constraints = {}
+    required = set(config["group_key"] + ["STOP_LIST_STATUS", "MATCH_NEGATIVE_CASE", "INSPECTED_PERSON"])
+    for name in dict.fromkeys(config["group_key"] + config["row_key"] + ["SBOL_PRO_PLATFORM"]):
+        fields = [name]
+        if name in config["lookups"]:
+            fields.append(config["lookups"][name]["description_field"])
+        values, unreadable, has_formula = [], False, False
+        for f in fields:
+            if header(f) not in cols:
+                continue
+            cell = sheet.cell(row, cols[header(f)])
+            if cell.data_type == "f":
+                has_formula = True
+                continue
+            try:
+                value = literal(cell)
+                if not blank(value):
+                    values.append(value)
+            except ImportProblem:
+                unreadable = True
+        if unreadable:
+            choices = None
+        elif not values:
+            choices = None if name in required or has_formula else {""}
+        elif name in config["lookups"]:
+            candidates = [catalog.possible_codes(name, value) for value in values]
+            # При противоречивых коде и описании учитываем оба варианта.
+            choices = None if any(c is None for c in candidates) else set().union(*candidates)
+        else:
+            try:
+                choices = {norm(amount(v) if name == "MAX_AMOUNT" else v) for v in values}
+            except ImportProblem:
+                choices = None
+        constraints[name] = choices
+    return constraints
+
+
+def could_match(record, constraints, config):
+    for name, choices in constraints.items():
+        if name == "SBOL_PRO_PLATFORM" and norm(record.values.get("CHANNEL_INDICATOR")) != norm(config["platform_channel"]):
+            continue
+        if choices is not None and norm(record.values.get(name)) not in choices:
+            return False
+    return True
 
 
 def payload(record, cols, config):
@@ -490,6 +577,7 @@ class Result:
     skipped: int = 0
     total: int = 0
     output: str = ""
+    conflicts: list[str] = field(default_factory=list)
 
 
 def import_files(matrix, templates, output, config_path=None, progress: Callable[[str], None] = lambda _: None):
@@ -524,48 +612,69 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
         if missing:
             raise ImportProblem("В матрице нет столбцов: " + ", ".join(sorted(missing)))
         catalog = Catalog(book, config)
-        incoming = []
+        incoming, conflicts = [], []
         for path in templates:
             progress(f"Читаю шаблон {path.name}…")
             try:
-                incoming.extend(parse_template(path, catalog, config))
+                incoming.extend(parse_template(path, catalog, config, conflicts))
             except ImportProblem as exc:
                 if str(exc).startswith(f"{path.name}, "):
                     raise
                 raise ImportProblem(f"{path.name}: {exc}") from exc
-        result = Result(total=len(incoming), output=str(output))
+        result = Result(total=len(incoming) + len(conflicts), output=str(output), conflicts=conflicts)
         progress("Сопоставляю записи матрицы…")
         index = defaultdict(list)
+        uncertain = []
         last = config["matrix_header_row"]
         for row in range(last + 1, sheet.max_row + 1):
             # Предзаполненные формулы ниже данных не считаем записями.
             active = [sheet.cell(row, cols[header(f)]).value for f in ("SP_NAME_DESCRIPTION", "OPERATION_DESCRIPTION", "STOP_LIST_STATUS_DESCRIPTION")]
             if all(blank(v) for v in active):
                 continue
+            last = row
             try:
                 record = read_matrix_row(sheet, cols, row, catalog, config)
             except ImportProblem as exc:
-                raise ImportProblem(f"Матрица, строка {row}: {exc}") from exc
-            index[record.key(config)].append(row)
-            last = row
+                uncertain.append((row, uncertain_constraints(sheet, cols, row, catalog, config), str(exc)))
+            else:
+                index[record.key(config)].append(row)
             if row % 5000 == 0:
                 progress(f"Проверено строк матрицы: {row:,}")
         old_end = last
-        plans, seen = [], {}
+        plans, seen = [], set()
+        # Сначала группируем весь пакет: конфликтующие шаблоны не должны менять
+        # строку по принципу «кто первый», даже если один из них появился позднее.
+        signatures, template_conflicts = {}, set()
         for record in incoming:
             key = record.key(config)
             values = payload(record, cols, config)
             signature = tuple(sorted((k, None if blank(v) else v) for k, v in values.items()))
+            if key in signatures and signatures[key] != signature:
+                template_conflicts.add(key)
+            signatures[key] = signature
+        uncertain_matches = {}
+        for record in incoming:
+            key = record.key(config)
+            values = payload(record, cols, config)
+            if key in template_conflicts:
+                result.conflicts.append(f"{record.source}: конфликт шаблонов — для одной записи заданы разные значения. Строка пропущена; требуется ручной разбор.")
+                continue
+            matches = index.get(key, [])
+            if key not in uncertain_matches:
+                uncertain_matches[key] = [(row, reason) for row, constraints, reason in uncertain if could_match(record, constraints, config)]
+            unclear = uncertain_matches[key]
+            if len(matches) > 1 or unclear:
+                reasons = []
+                if len(matches) > 1:
+                    reasons.append(f"в матрице несколько подходящих строк: {matches[:10]}")
+                if unclear:
+                    reasons.append("возможное совпадение с неразобранными строками матрицы: " + "; ".join(f"{row} ({reason})" for row, reason in unclear[:3]))
+                result.conflicts.append(f"{record.source}: {'; '.join(reasons)}. Строка пропущена; требуется ручной разбор.")
+                continue
             if key in seen:
-                old_signature, source = seen[key]
-                if signature != old_signature:
-                    raise ImportProblem(f"Конфликт шаблонов: {source} и {record.source} описывают одну запись разными значениями.")
                 result.skipped += 1
                 continue
-            seen[key] = (signature, record.source)
-            matches = index.get(key, [])
-            if len(matches) > 1:
-                raise ImportProblem(f"{record.source}: в матрице несколько подходящих строк: {matches[:10]}.")
+            seen.add(key)
             if matches:
                 row = matches[0]
                 changes = {}
@@ -595,9 +704,10 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
         if proto <= config["matrix_header_row"] or proto > old_end:
             raise ImportProblem("В матрице нет образцовой строки для копирования формул и оформления.")
         # Проверяем отсутствие вычислений во входных столбцах до добавления строк.
-        for field in payload(incoming[0], cols, config):
-            if field not in config["lookups"] and sheet.cell(proto, cols[header(field)]).data_type == "f":
-                raise ImportProblem(f"Образцовая строка: входное поле {field} содержит формулу.")
+        if incoming:
+            for field_name in payload(incoming[0], cols, config):
+                if field_name not in config["lookups"] and sheet.cell(proto, cols[header(field_name)]).data_type == "f":
+                    raise ImportProblem(f"Образцовая строка: входное поле {field_name} содержит формулу.")
         progress("Записываю изменения и сохраняю новый файл…")
         for row, values, is_new in plans:
             if is_new:

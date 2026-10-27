@@ -29,6 +29,7 @@ function status(message, state = "running") {
   $("status-badge").textContent = state === "error" ? "Ошибка" : state === "done" ? "Готово" : "В работе";
   $("status-message").textContent = message;
   $("progress").hidden = state !== "running";
+  $("conflicts-panel").hidden = true;
   if (state !== "done") { $("counts").hidden = true; $("download-row").hidden = true; }
 }
 async function api(path, options = {}) {
@@ -54,8 +55,14 @@ async function watch(id) {
     if (job.state === "error") throw new Error(job.error || job.message);
     if (job.state === "done") {
       currentResult = job;
-      status("Все выбранные шаблоны обработаны. Скачайте обновлённую матрицу.", "done");
-      for (const field of ["added", "updated", "skipped"]) $(field).textContent = job.counts[field];
+      const conflicts = job.conflicts || [];
+      status(conflicts.length ? "Импорт завершён с пропусками. Конфликтующие записи не изменены и не добавлены; проверьте список для ручного разбора. Остальные изменения сохранены." : "Все выбранные шаблоны обработаны. Скачайте обновлённую матрицу.", "done");
+      for (const field of ["added", "updated", "skipped", "conflicted"]) $(field).textContent = job.counts[field];
+      if (conflicts.length) {
+        $("status-badge").textContent = "Есть пропуски";
+        $("conflicts").textContent = conflicts.join("\n\n");
+        $("conflicts-panel").hidden = false;
+      }
       $("counts").hidden = false; $("download-row").hidden = false;
       return;
     }
