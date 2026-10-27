@@ -173,7 +173,7 @@ class LocalServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MatrixImporter/0.2.1"
+    server_version = "MatrixImporter/0.2.2"
     protocol_version = "HTTP/1.0"
 
     def log_message(self, *_):
@@ -266,7 +266,7 @@ class Handler(BaseHTTPRequestHandler):
             name, mime = assets[path]
             return self._send(200, (ASSETS / name).read_bytes(), mime)
         if method == "GET" and path == "/api/info":
-            return self._send(200, {"demo": app.demo_available(), "version": "0.2.1"})
+            return self._send(200, {"demo": app.demo_available(), "version": "0.2.2"})
         if method == "POST" and path == "/api/jobs":
             return self._send(201, app.describe(app.create_job(self._json())))
         if method == "POST" and path == "/api/demo":
@@ -338,7 +338,7 @@ def start(config_path=None, port=8765, open_browser=True):
                 raise
             server = LocalServer(0, app)
         url = f"http://127.0.0.1:{server.server_port}"
-        print(f"MatrixImporter 0.2.1\nОткройте в браузере: {url}\nДля завершения нажмите Ctrl+C в этом терминале.", flush=True)
+        print(f"MatrixImporter 0.2.2\nОткройте в браузере: {url}\nДля завершения нажмите Ctrl+C в этом терминале.", flush=True)
         if open_browser:
             def launch_browser():
                 try:

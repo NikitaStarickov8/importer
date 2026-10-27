@@ -310,6 +310,101 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(book.worksheets[0]['AK2'].data_type, 's')
         book.close()
 
+    def test_unrelated_incomplete_client_rows_do_not_block_import(self):
+        def edit(book):
+            sheet = book['Типы Клиентов']
+            sheet.append(['UNUSED', 20, None])
+            sheet.append([None, 30, 'Другой незаполненный тип'])
+            sheet.append([None, 40, None])
+        matrix = self.change(self.matrix, edit, 'incomplete_catalog.xlsx')
+        result = self.run_import(matrix=matrix, templates=[self.templates[0]])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+        book = load_workbook(self.output)
+        self.assertEqual(book['Типы Клиентов']['A3'].value, 'UNUSED')
+        self.assertIsNone(book['Типы Клиентов']['C3'].value)
+        self.assertEqual(book['Типы Клиентов']['C4'].value, 'Другой незаполненный тип')
+        book.close()
+
+    def test_simple_links_in_catalog_are_resolved(self):
+        def edit(book):
+            sheet = book['Типы Клиентов']
+            helper = book.create_sheet('Значения справочника')
+            helper['A1'], helper['B1'] = 'PRODUCT_OWNER', 'Владелец продукта'
+            sheet['A2'] = "='Значения справочника'!$A$1"
+            sheet['C2'] = "='Значения справочника'!$B$1"
+        matrix = self.change(self.matrix, edit, 'catalog_links.xlsx')
+        result = self.run_import(matrix=matrix, templates=[self.templates[0]])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_requested_incomplete_client_entry_reports_exact_cell(self):
+        matrix = self.change(self.matrix, lambda b: setattr(b['Типы Клиентов']['A2'], 'value', None), 'missing_client_code.xlsx')
+        with self.assertRaises(ImportProblem) as context:
+            self.run_import(matrix=matrix, templates=[self.templates[0]])
+        message = str(context.exception)
+        self.assertIn('Типы Клиентов', message)
+        self.assertIn('Владелец продукта', message)
+        self.assertIn('строка 2', message)
+        self.assertIn('A2', message)
+        self.assertFalse(self.output.exists())
+
+    def test_lookup_by_code_does_not_bypass_missing_description(self):
+        matrix = self.change(self.matrix, lambda b: setattr(b['Типы Клиентов']['C2'], 'value', None), 'missing_client_description.xlsx')
+        template = self.change(self.templates[0], lambda b: setattr(b.worksheets[0]['H18'], 'value', 'PRODUCT_OWNER'), 'client_by_code.xlsx')
+        with self.assertRaisesRegex(ImportProblem, 'C2.*пустое поле'):
+            self.run_import(matrix=matrix, templates=[template])
+        self.assertFalse(self.output.exists())
+
+    def test_requested_catalog_formula_reports_its_cell(self):
+        matrix = self.change(self.matrix, lambda b: setattr(b['Типы Клиентов']['A2'], 'value', '=1+1'), 'catalog_formula.xlsx')
+        with self.assertRaisesRegex(ImportProblem, 'A2.*неожиданная формула'):
+            self.run_import(matrix=matrix, templates=[self.templates[0]])
+        self.assertFalse(self.output.exists())
+
+    def test_unrelated_formula_catalog_row_does_not_block_literal_entry(self):
+        matrix = self.change(self.matrix, lambda b: b['Типы Клиентов'].append(['=1+1', 20, 'Неиспользуемый тип']), 'unused_formula.xlsx')
+        result = self.run_import(matrix=matrix, templates=[self.templates[0]])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_missing_value_diagnostics_include_incomplete_catalog_rows(self):
+        matrix = self.change(self.matrix, lambda b: setattr(b['Типы Клиентов']['C2'], 'value', None), 'missing_description.xlsx')
+        with self.assertRaises(ImportProblem) as context:
+            self.run_import(matrix=matrix, templates=[self.templates[0]])
+        self.assertIn('не найдено', str(context.exception))
+        self.assertIn('C2', str(context.exception))
+        self.assertIn('Типы Клиентов', str(context.exception))
+        self.assertFalse(self.output.exists())
+
+    def test_bad_duplicate_alias_is_not_ignored(self):
+        matrix = self.change(self.matrix, lambda b: b['Типы Клиентов'].append([None, 20, 'Владелец продукта']), 'bad_duplicate.xlsx')
+        with self.assertRaisesRegex(ImportProblem, 'A3'):
+            self.run_import(matrix=matrix, templates=[self.templates[0]])
+        self.assertFalse(self.output.exists())
+
+    def test_template_filename_is_not_duplicated_in_error(self):
+        template = self.change(self.templates[0], lambda b: setattr(b.worksheets[0]['J18'], 'value', 'UNKNOWN'), 'unique_template_name.xlsx')
+        with self.assertRaises(ImportProblem) as context:
+            self.run_import(templates=[template])
+        self.assertEqual(str(context.exception).count('unique_template_name.xlsx'), 1)
+
+    def test_template_needs_only_its_three_reference_sheets(self):
+        def edit(book):
+            sheet = book.worksheets[0]
+            book.remove(book['Типы Клиентов'])
+            for title in ('Каналы', 'COMPLIANCE_STOP_LIST_CODES', 'Статусы Стоп Листа'):
+                reference = book.create_sheet(title)
+                reference.append(['Код', 'Описание'])
+                reference.append(['WRONG_TEMPLATE_CODE', 'СБОЛ про'])
+            # Клиент берётся из B8 и справочника основной матрицы, а не из D8.
+            sheet['H18'] = None
+        template = self.change(self.templates[0], edit, 'three_reference_sheets.xlsx')
+        result = self.run_import(templates=[template])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
+
+    def test_catalog_error_names_main_matrix_as_source(self):
+        matrix = self.change(self.matrix, lambda b: setattr(b['Типы Клиентов']['A2'], 'value', None), 'main_matrix_bad_catalog.xlsx')
+        with self.assertRaisesRegex(ImportProblem, 'основной матрице.*Типы Клиентов'):
+            self.run_import(matrix=matrix, templates=[self.templates[0]])
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

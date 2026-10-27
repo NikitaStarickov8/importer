@@ -96,31 +96,70 @@ class Catalog:
         self.book = book
         self.config = config
         self.indices = {}
+        self.invalid_aliases = {}
+        self.issues = {}
+        self.catalog_locations = {}
         self.cache = {}
+
+    def _build_index(self, name):
+        spec = self.config["lookups"][name]
+        try:
+            sheet = sheet_named(self.book, spec["sheet"])
+        except ImportProblem as exc:
+            raise ImportProblem(f"Основная матрица, справочник «{spec['sheet']}»: {exc}") from exc
+        index, invalid = defaultdict(set), defaultdict(list)
+        issues = []
+        for row in sheet.iter_rows(min_row=2, max_col=max(spec["code_col"], spec["description_col"])):
+            code_cell, desc_cell = row[spec["code_col"] - 1], row[spec["description_col"] - 1]
+            values, problems = [], []
+            for label, cell in (("код", code_cell), ("описание", desc_cell)):
+                try:
+                    value = template_value(cell)
+                except ImportProblem as exc:
+                    value = None
+                    problems.append(str(exc))
+                else:
+                    if blank(value):
+                        problems.append(f"{cell.coordinate}: пустое поле «{label}»")
+                values.append(value)
+            code, desc = values
+            if blank(code) and blank(desc) and all(blank(c.value) for c in (code_cell, desc_cell)):
+                continue
+            if problems:
+                issue = f"строка {code_cell.row}, {code_cell.coordinate}/{desc_cell.coordinate}: " + "; ".join(problems)
+                issues.append(issue)
+                # Ошибка блокирует поиск только по связанному с ней коду/описанию.
+                # Неразрешённые формулы не превращаем в нули и не используем их кэш.
+                for alias in {norm(v) for v in values if not blank(v)}:
+                    invalid[alias].append(issue)
+                continue
+            entry = Entry(code, desc)
+            index[norm(code)].add(entry)
+            index[norm(desc)].add(entry)
+        self.indices[name] = index
+        self.invalid_aliases[name] = invalid
+        self.issues[name] = issues
+        self.catalog_locations[name] = (sheet.title, get_column_letter(spec["code_col"]), get_column_letter(spec["description_col"]))
 
     def resolve(self, name, value):
         cache_key = (name, norm(value))
         if cache_key in self.cache:
             return self.cache[cache_key]
         if name not in self.indices:
-            spec = self.config["lookups"][name]
-            sheet = sheet_named(self.book, spec["sheet"])
-            index = defaultdict(set)
-            for row in sheet.iter_rows(min_row=2, values_only=True):
-                code = row[spec["code_col"] - 1] if len(row) >= spec["code_col"] else None
-                desc = row[spec["description_col"] - 1] if len(row) >= spec["description_col"] else None
-                if blank(code) and blank(desc):
-                    continue
-                if blank(code) or blank(desc) or formula(code) or formula(desc):
-                    raise ImportProblem(f"Справочник «{sheet.title}»: пустой код/описание или формула.")
-                entry = Entry(code, desc)
-                index[norm(code)].add(entry)
-                index[norm(desc)].add(entry)
-            self.indices[name] = index
+            self._build_index(name)
+        title, code_col, desc_col = self.catalog_locations[name]
+        invalid = self.invalid_aliases[name].get(norm(value), [])
+        if invalid:
+            details = "; ".join(invalid[:3])
+            raise ImportProblem(f"{name}: для значения «{value}» в основной матрице, справочник «{title}», есть неполная или непрочитанная запись: {details}.")
         candidates = self.indices[name].get(norm(value), set())
         if len(candidates) != 1:
             reason = "не найдено" if not candidates else "соответствует нескольким записям"
-            raise ImportProblem(f"{name}: значение «{value}» {reason} в справочнике.")
+            details = ""
+            if not candidates and self.issues[name]:
+                details = " Неполные/непрочитанные строки, которые можно проверить: " + "; ".join(self.issues[name][:3]) + "."
+            raise ImportProblem(f"{name}: значение «{value}» {reason} в основной матрице, справочник «{title}» "
+                                f"(код — столбец {code_col}, описание — {desc_col}).{details}")
         entry = next(iter(candidates))
         self.cache[cache_key] = entry
         return entry
@@ -448,6 +487,8 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
             try:
                 incoming.extend(parse_template(path, catalog, config))
             except ImportProblem as exc:
+                if str(exc).startswith(f"{path.name}, "):
+                    raise
                 raise ImportProblem(f"{path.name}: {exc}") from exc
         result = Result(total=len(incoming), output=str(output))
         progress("Сопоставляю записи матрицы…")
