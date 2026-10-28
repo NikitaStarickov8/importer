@@ -8,14 +8,14 @@ import shutil
 import tempfile
 import threading
 import webbrowser
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 from zipfile import BadZipFile
 
-from .importer import ROOT, ImportProblem, import_files
+from .importer import ROOT, ImportProblem, format_change_report, import_files
 
 ASSETS = Path(__file__).with_name("web_assets")
 MAX_FILE = 256 * 1024 * 1024
@@ -55,6 +55,10 @@ class Job:
     message: str = "Ожидаю файлы…"
     counts: dict | None = None
     conflicts: list = field(default_factory=list)
+    changes: list = field(default_factory=list)
+    affected_rows: list = field(default_factory=list)
+    change_report: str = ""
+    outcomes: list = field(default_factory=list)
     error: str | None = None
     filename: str = ""
 
@@ -112,7 +116,9 @@ class AppState:
             if job.error:
                 result["error"] = job.error
             if job.counts is not None:
-                result.update(counts=job.counts, conflicts=job.conflicts, download_url=f"/api/jobs/{job.id}/download", filename=job.filename)
+                result.update(counts=job.counts, conflicts=job.conflicts, changes=job.changes,
+                              affected_rows=job.affected_rows, change_report=job.change_report, outcomes=job.outcomes,
+                              download_url=f"/api/jobs/{job.id}/download", filename=job.filename)
             return result
 
     def launch(self, job):
@@ -133,9 +139,22 @@ class AppState:
                 job.message = message
         try:
             result = import_files(job.paths[0], job.paths[1:], job.folder / "result.xlsx", self.config_path, progress, environment=job.environment)
+            def original_names(text):
+                for path, item in zip(job.paths, job.manifest):
+                    text = text.replace(path.name, item["name"])
+                return text
+            for outcome in result.outcomes:
+                outcome.source = original_names(outcome.source)
+                outcome.reason = original_names(outcome.reason)
+            result.conflicts = [original_names(message) for message in result.conflicts]
+            result.change_report = format_change_report(result)
             with self.lock:
                 job.counts = {"added": result.added, "updated": result.updated, "skipped": result.skipped, "conflicted": len(result.conflicts), "versioned": result.versioned, "promoted": result.promoted, "prom_deactivated": result.prom_deactivated, "total": result.total}
                 job.conflicts = result.conflicts
+                job.changes = [asdict(change) for change in result.changes]
+                job.affected_rows = result.affected_rows
+                job.change_report = result.change_report
+                job.outcomes = [asdict(outcome) for outcome in result.outcomes]
                 job.filename = f"matrix_result_{job.environment}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
                 job.state, job.message = "done", "Импорт завершён"
         except Exception as exc:
@@ -179,7 +198,7 @@ class LocalServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MatrixImporter/0.3.1"
+    server_version = "MatrixImporter/0.3.2"
     protocol_version = "HTTP/1.0"
 
     def log_message(self, *_):
@@ -272,7 +291,7 @@ class Handler(BaseHTTPRequestHandler):
             name, mime = assets[path]
             return self._send(200, (ASSETS / name).read_bytes(), mime)
         if method == "GET" and path == "/api/info":
-            return self._send(200, {"demo": app.demo_available(), "version": "0.3.1"})
+            return self._send(200, {"demo": app.demo_available(), "version": "0.3.2"})
         if method == "POST" and path == "/api/jobs":
             return self._send(201, app.describe(app.create_job(self._json())))
         if method == "POST" and path == "/api/demo":
@@ -346,7 +365,7 @@ def start(config_path=None, port=8765, open_browser=True):
                 raise
             server = LocalServer(0, app)
         url = f"http://127.0.0.1:{server.server_port}"
-        print(f"MatrixImporter 0.3.1\nОткройте в браузере: {url}\nДля завершения нажмите Ctrl+C в этом терминале.", flush=True)
+        print(f"MatrixImporter 0.3.2\nОткройте в браузере: {url}\nДля завершения нажмите Ctrl+C в этом терминале.", flush=True)
         if open_browser:
             def launch_browser():
                 try:

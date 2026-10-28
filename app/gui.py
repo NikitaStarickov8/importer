@@ -143,7 +143,7 @@ def start(config_path=None):
                     text = f"Добавлено: {value.added}. Обновлено: {value.updated}. Без изменений: {value.skipped}. На ручной разбор: {len(value.conflicts)}."
                     text += f" Новых ИФТ-версий: {value.versioned}. Включено в ПРОМ: {value.promoted}; прежних ПРОМ-версий отключено: {value.prom_deactivated}. Среда: {value.environment}. Байпас проверьте вручную."
                     status.set(text)
-                    details = "\n\n".join(value.conflicts)
+                    details = value.change_report + "\n\n" + "\n\n".join(value.conflicts)
                     messagebox.showinfo("Готово", f"{text}\n\nСохранено:\n{value.output}\n\n{details}")
                 else:
                     status.set("Импорт остановлен. Выходной файл не сохранён.")

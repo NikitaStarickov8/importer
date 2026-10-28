@@ -360,7 +360,7 @@ def template_value(cell, visited=None):
     return template_value(target, visited | {location})
 
 
-def parse_template(path, catalog, config, conflicts=None):
+def parse_template(path, catalog, config, conflicts=None, outcomes=None):
     book = load_workbook(path, read_only=False, data_only=False)
     try:
         matches = [s for s in book if norm(config["template_sheet_contains"]) in norm(s.title)]
@@ -433,7 +433,10 @@ def parse_template(path, catalog, config, conflicts=None):
             except AmbiguousLookup as exc:
                 if conflicts is None:
                     raise
-                conflicts.append(f"{source}: {exc} Строка пропущена; требуется ручной разбор.")
+                reason = f"{exc} Строка пропущена; требуется ручной разбор."
+                conflicts.append(f"{source}: {reason}")
+                if outcomes is not None:
+                    outcomes.append(RecordOutcome(source, "conflict", [], reason))
             except ImportProblem as exc:
                 raise ImportProblem(f"{source}: {exc}") from exc
         if not row_count:
@@ -643,6 +646,81 @@ class Plan:
 
 
 @dataclass
+class RowChange:
+    excel_row: int
+    action: str
+    changed_fields: list[str]
+    related_row: int | None
+    first_column_name: str
+    first_column_value: str | None
+    first_column_kind: str
+
+
+@dataclass
+class RecordOutcome:
+    source: str
+    status: str
+    excel_rows: list[int]
+    reason: str
+
+
+def add_outcome(result, source, status, rows, reason):
+    outcome = RecordOutcome(source, status, sorted(set(rows)), reason)
+    result.outcomes.append(outcome)
+    return outcome
+
+
+def add_conflict(result, source, reason, rows=()):
+    result.conflicts.append(f"{source}: {reason}")
+    add_outcome(result, source, "conflict", rows, reason)
+
+
+def row_change(sheet, row, action, fields, related_row, header_row):
+    cell = sheet.cell(row, 1)
+    kind = "formula" if cell.data_type == "f" else "error" if cell.data_type == "e" else "blank" if blank(cell.value) else "value"
+    return RowChange(row, action, list(fields), related_row,
+                     str(sheet.cell(header_row, 1).value or "Первый столбец"),
+                     str(cell.value) if kind in ("value", "error") else None, kind)
+
+
+def format_change_report(result):
+    lines = [f"Среда: {'ИФТ' if result.environment == 'IFT' else 'ПРОМ'}.",
+             "Ниже указаны номера строк Excel в сохранённом результате, а не значения CODE.",
+             "Формулы первого столбца здесь не пересчитываются.", ""]
+    if not result.changes:
+        lines.append("Изменённых строк нет.")
+    else:
+        lines += ["Затронуты строки Excel: " + ", ".join(map(str, result.affected_rows)), ""]
+    labels = {"added": "добавлена запись", "updated": "изменена запись",
+              "version_added": "добавлена ИФТ-версия", "ift_deactivated": "снята отметка IFT",
+              "prom_activated": "поставлена отметка PROM", "prom_deactivated": "снята отметка PROM"}
+    links = {"version_added": "прежняя строка", "ift_deactivated": "новая версия",
+             "prom_activated": "прежняя ПРОМ-строка", "prom_deactivated": "включена строка"}
+    for change in result.changes:
+        line = f"Строка {change.excel_row}: {labels[change.action]}"
+        if change.action == "updated" and change.changed_fields:
+            line += "; поля: " + ", ".join(change.changed_fields)
+        if change.related_row is not None:
+            line += f"; {links[change.action]}: {change.related_row}"
+        if change.first_column_kind == "value":
+            line += f"; {change.first_column_name}={change.first_column_value}"
+        elif change.first_column_kind == "formula":
+            line += f"; {change.first_column_name}: значение после пересчёта формулы"
+        elif change.first_column_kind == "error":
+            line += f"; {change.first_column_name}: ошибка {change.first_column_value}"
+        lines.append(line)
+    if result.outcomes:
+        lines += ["", "Результат по строкам шаблонов:"]
+        statuses = {"added": "ДОБАВЛЕНА", "versioned": "НОВАЯ ИФТ-ВЕРСИЯ", "updated": "ИЗМЕНЕНА",
+                    "promoted": "ВКЛЮЧЕНА В ПРОМ", "unchanged": "БЕЗ ИЗМЕНЕНИЙ",
+                    "skipped": "ПРОПУЩЕНА: ПОВТОР", "conflict": "ПРОПУЩЕНА: РУЧНОЙ РАЗБОР"}
+        for outcome in result.outcomes:
+            rows = ", ".join(map(str, outcome.excel_rows)) or "не определены"
+            lines.append(f"{outcome.source} — {statuses[outcome.status]}; строки матрицы: {rows}. {outcome.reason}")
+    return "\n".join(lines)
+
+
+@dataclass
 class Result:
     added: int = 0
     updated: int = 0
@@ -654,6 +732,10 @@ class Result:
     environment: str = "IFT"
     promoted: int = 0
     prom_deactivated: int = 0
+    changes: list[RowChange] = field(default_factory=list)
+    affected_rows: list[int] = field(default_factory=list)
+    change_report: str = ""
+    outcomes: list[RecordOutcome] = field(default_factory=list)
 
 
 def import_files(matrix, templates, output, config_path=None, progress: Callable[[str], None] = lambda _: None, environment="IFT"):
@@ -689,16 +771,16 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
         if missing:
             raise ImportProblem("В матрице нет столбцов: " + ", ".join(sorted(missing)))
         catalog = Catalog(book, config)
-        incoming, conflicts = [], []
+        incoming, conflicts, outcomes = [], [], []
         for path in templates:
             progress(f"Читаю шаблон {path.name}…")
             try:
-                incoming.extend(parse_template(path, catalog, config, conflicts))
+                incoming.extend(parse_template(path, catalog, config, conflicts, outcomes))
             except ImportProblem as exc:
                 if str(exc).startswith(f"{path.name}, "):
                     raise
                 raise ImportProblem(f"{path.name}: {exc}") from exc
-        result = Result(total=len(incoming) + len(conflicts), output=str(output), conflicts=conflicts, environment=environment)
+        result = Result(total=len(incoming) + len(conflicts), output=str(output), conflicts=conflicts, environment=environment, outcomes=outcomes)
         progress("Сопоставляю записи матрицы…")
         index = defaultdict(list)
         prom_index = defaultdict(list)
@@ -735,7 +817,7 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
             if row % 5000 == 0:
                 progress(f"Проверено строк матрицы: {row:,}")
         old_end = last
-        plans, seen = [], set()
+        plans, seen = [], {}
         # Сначала группируем весь пакет: конфликтующие шаблоны не должны менять
         # строку по принципу «кто первый», даже если один из них появился позднее.
         signatures, template_conflicts = {}, set()
@@ -751,7 +833,7 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
             key = record.key(config)
             values = payload(record, cols, config)
             if key in template_conflicts:
-                result.conflicts.append(f"{record.source}: конфликт шаблонов — для одной записи заданы разные значения. Строка пропущена; требуется ручной разбор.")
+                add_conflict(result, record.source, "конфликт шаблонов — для одной записи заданы разные значения. Строка пропущена; требуется ручной разбор.", [*index.get(key, []), *prom_index.get(key, [])])
                 continue
             matches = index.get(key, [])
             if key not in uncertain_matches:
@@ -766,41 +848,47 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                     reasons.append(f"в матрице несколько активных строк ПРОМ: {prom_matches[:10]}")
                 if unclear:
                     reasons.append("возможное совпадение с неразобранными строками матрицы: " + "; ".join(f"{row} ({reason})" for row, reason in unclear[:3]))
-                result.conflicts.append(f"{record.source}: {'; '.join(reasons)}. Строка пропущена; требуется ручной разбор.")
+                add_conflict(result, record.source, f"{'; '.join(reasons)}. Строка пропущена; требуется ручной разбор.", [*matches, *prom_matches, *(r for r, _ in unclear)])
                 continue
             if key in seen:
                 result.skipped += 1
+                first = seen[key]
+                add_outcome(result, record.source, "skipped", first.excel_rows, f"Повтор такой же записи в загруженных шаблонах. Первый источник: {first.source}.")
                 continue
             if environment == "PROM":
                 current_prom = prom_matches[0] if prom_matches else None
-                ready, unreadable = [], []
+                ready, unreadable, mismatch_fields = [], [], set()
                 for candidate in matches:
                     candidate_changes, candidate_unsafe = payload_changes(sheet, cols, candidate, values)
+                    mismatch_fields.update(candidate_changes)
                     if candidate_unsafe:
                         unreadable.append(candidate)
                     elif not candidate_changes:
                         ready.append(candidate)
                 if len(ready) > 1 or unreadable:
                     reason = f"несколько ИФТ-строк с одинаковыми ключом и содержимым: {ready[:10]}" if len(ready) > 1 else f"содержимое ИФТ-строк нельзя проверить: {unreadable[:10]}"
-                    result.conflicts.append(f"{record.source}: {reason}. Отметки не изменены; требуется ручной разбор.")
+                    add_conflict(result, record.source, f"{reason}. Отметки не изменены; требуется ручной разбор.", [*ready, *unreadable, *prom_matches])
                     continue
                 already_deployed = False
                 if current_prom is not None:
                     current_changes, unsafe = payload_changes(sheet, cols, current_prom, values)
                     already_deployed = not current_changes and not unsafe
                     if already_deployed and (not ready or ready[0] == current_prom):
-                        seen.add(key)
+                        seen[key] = add_outcome(result, record.source, "unchanged", [current_prom], "Нужные реакция, заголовок и текст уже действуют в ПРОМ; переключение отметок не требуется.")
                         result.skipped += 1
                         continue
                 if not ready:
                     reason = "нет активной ИФТ-строки" if not matches else f"содержимое активных ИФТ-строк {matches[:10]} не совпадает с шаблоном"
-                    result.conflicts.append(f"{record.source}: {reason} для включения в ПРОМ. Ничего не изменено; требуется ручной разбор.")
+                    if mismatch_fields:
+                        reason += "; отличаются поля: " + ", ".join(sorted(mismatch_fields))
+                    add_conflict(result, record.source, f"{reason} для включения в ПРОМ. Ничего не изменено; требуется ручной разбор.", [*matches, *prom_matches])
                     continue
                 row = ready[0]
                 # В ПРОМ переносится готовая ИФТ-версия. Её данные и байпас
                 # не переписываются, новые строки здесь не создаются.
                 plans.append(Plan(row, {"PROM": 1}, old_version=current_prom))
-                seen.add(key)
+                rows = [row] + ([current_prom] if current_prom is not None else [])
+                seen[key] = add_outcome(result, record.source, "promoted", rows, f"Готовой ИФТ-строке {row} поставлен PROM=1." + (f" У прежней строки {current_prom} снят только PROM." if current_prom is not None else " Прежней ПРОМ-версии нет."))
                 result.updated += 1
                 result.promoted += 1
                 if current_prom is not None:
@@ -811,9 +899,8 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                 # Ключи и прочие столбцы существующей записи не редактируются.
                 changes, unsafe = payload_changes(sheet, cols, row, values)
                 if unsafe:
-                    result.conflicts.append(f"{record.source}: поля {', '.join(unsafe)} в строке матрицы {row} вычисляются формулой. Строка пропущена; требуется ручной разбор.")
+                    add_conflict(result, record.source, f"поля {', '.join(unsafe)} в строке матрицы {row} содержат формулу или ошибку. Строка пропущена; требуется ручной разбор.", [row])
                     continue
-                seen.add(key)
                 if changes:
                     if modes[row] == "version":
                         last += 1
@@ -826,17 +913,20 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                         plans.append(Plan(last, version_values, prototype=row, old_version=row))
                         result.added += 1
                         result.versioned += 1
+                        seen[key] = add_outcome(result, record.source, "versioned", [row, last], f"Добавлена ИФТ-версия {last}; у прежней строки {row} снят только IFT. Изменены поля: {', '.join(changes)}.")
                     else:
                         plans.append(Plan(row, changes))
                         result.updated += 1
+                        seen[key] = add_outcome(result, record.source, "updated", [row], "Изменены поля: " + ", ".join(changes) + ".")
                 else:
                     result.skipped += 1
+                    seen[key] = add_outcome(result, record.source, "unchanged", [row], "Реакция, экранный заголовок и текст совпадают; изменений не требуется.")
             else:
-                seen.add(key)
                 last += 1
                 values.update(IFT=1 if environment == "IFT" else None, PROM=1 if environment == "PROM" else None)
                 plans.append(Plan(last, values, prototype=config["prototype_row"]))
                 result.added += 1
+                seen[key] = add_outcome(result, record.source, "added", [last], "Активная ИФТ-запись с таким ключом отсутствовала; добавлена новая строка.")
         proto = config["prototype_row"]
         if proto <= config["matrix_header_row"] or proto > old_end:
             raise ImportProblem("В матрице нет образцовой строки для копирования формул и оформления.")
@@ -850,11 +940,17 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                     if field_name not in config["lookups"] and field_name not in ("IFT", "PROM") and sheet.cell(plan.prototype, cols[header(field_name)]).data_type == "f":
                         raise ImportProblem(f"Образцовая строка {plan.prototype}: входное поле {field_name} содержит формулу.")
                 append_row(sheet, cols, row, plan.prototype, values, config, copy_constants=plan.old_version is not None)
+                action = "version_added" if plan.old_version is not None else "added"
+                result.changes.append(row_change(sheet, row, action, [], plan.old_version, config["matrix_header_row"]))
             else:
                 for field, value in values.items():
                     text_write(sheet.cell(row, cols[header(field)]), value)
+                action = "prom_activated" if environment == "PROM" else "updated"
+                result.changes.append(row_change(sheet, row, action, values.keys(), plan.old_version, config["matrix_header_row"]))
             if plan.old_version is not None:
                 text_write(sheet.cell(plan.old_version, cols[environment]), None)
+                action = "prom_deactivated" if environment == "PROM" else "ift_deactivated"
+                result.changes.append(row_change(sheet, plan.old_version, action, [environment], row, config["matrix_header_row"]))
         grow_ranges(sheet, old_end, last, config["matrix_header_row"] + 1)
         book.calculation = CalcProperties(calcId=0, fullCalcOnLoad=True, forceFullCalc=True, calcMode="auto")
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -873,6 +969,9 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                     raise
         finally:
             Path(tmp).unlink(missing_ok=True)
+        result.changes.sort(key=lambda change: change.excel_row)
+        result.affected_rows = sorted({change.excel_row for change in result.changes})
+        result.change_report = format_change_report(result)
         return result
     finally:
         book.close()

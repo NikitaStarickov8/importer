@@ -30,6 +30,7 @@ function status(message, state = "running") {
   $("status-message").textContent = message;
   $("progress").hidden = state !== "running";
   $("conflicts-panel").hidden = true;
+  $("changes-panel").hidden = true;
   if (state !== "done") { $("counts").hidden = true; $("download-row").hidden = true; }
 }
 async function api(path, options = {}) {
@@ -66,6 +67,11 @@ async function watch(id) {
         $("conflicts").textContent = conflicts.join("\n\n");
         $("conflicts-panel").hidden = false;
       }
+      const affected = job.affected_rows || [];
+      $("changes-summary").textContent = `Отчёт по строкам шаблонов (${(job.outcomes || []).length})`;
+      $("affected-rows").textContent = affected.length ? `Изменены строки Excel (${affected.length}): ${affected.join(", ")}` : "Изменённых строк нет. Причины пропусков и совпадений указаны ниже.";
+      $("row-changes").textContent = job.change_report || "";
+      $("changes-panel").hidden = false;
       $("counts").hidden = false; $("download-row").hidden = false;
       return;
     }
@@ -127,6 +133,14 @@ $("download").addEventListener("click", async () => {
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   } catch (error) { $("status-message").textContent = error.message; }
   finally { $("download").disabled = false; }
+});
+$("download-report").addEventListener("click", () => {
+  if (!currentResult) return;
+  const blob = new Blob([currentResult.change_report || "Изменённых строк нет."], {type:"text/plain;charset=utf-8"});
+  const url = URL.createObjectURL(blob), link = document.createElement("a");
+  link.href = url; link.download = currentResult.filename.replace(/\.xlsx$/i, "_rows.txt");
+  document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 });
 api("/api/info").then(response => response.json()).then(info => { $("demo").hidden = !info.demo; }).catch(error => status(error.message, "error"));
 refresh();
