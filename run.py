@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--templates", nargs="+", help="Один или несколько шаблонов .xlsx")
     parser.add_argument("--output", help="Новое имя результата .xlsx")
     parser.add_argument("--config", help="Другой config.json")
+    parser.add_argument("--environment", choices=("IFT", "PROM"), help="Среда задачи для CLI: IFT (ИФТ) или PROM (ПРОМ)")
     parser.add_argument("--port", type=int, default=8765, help="Порт локального интерфейса (по умолчанию 8765)")
     parser.add_argument("--no-browser", action="store_true", help="Не открывать браузер автоматически")
     parser.add_argument("--desktop", action="store_true", help="Старое окно Tkinter (необязательно)")
@@ -28,9 +29,11 @@ def main():
     if any((args.matrix, args.templates, args.output)):
         if not all((args.matrix, args.templates, args.output)):
             parser.error("Для CLI нужны --matrix, --templates и --output вместе.")
+        if args.environment is None:
+            parser.error("Для CLI выберите среду: --environment IFT или --environment PROM.")
         try:
             result = import_files(args.matrix, args.templates, args.output, args.config,
-                                  progress=lambda s: print(s, file=sys.stderr))
+                                  progress=lambda s: print(s, file=sys.stderr), environment=args.environment)
             print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
             return 0
         except (ImportProblem, OSError, ValueError) as exc:

@@ -23,6 +23,7 @@ def start(config_path=None):
     ttk.Label(outer, text="Импорт потреб в матрицу", style="Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
     ttk.Label(outer, text="Выберите актуальную матрицу и заполненные шаблоны .xlsx.", style="Hint.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 20))
     matrix_var = tk.StringVar()
+    environment_var = tk.StringVar()
     status = tk.StringVar(value="Готов к работе")
     controls = []
     files = []
@@ -51,10 +52,11 @@ def start(config_path=None):
         show_files()
 
     def demo():
+        environment_var.set("IFT")
         matrix_var.set(str(ROOT / "examples" / "01_matrix.xlsx"))
         files[:] = [str(ROOT / "examples" / "02_template_update.xlsx"), str(ROOT / "examples" / "03_template_new_group.xlsx")]
         show_files()
-        status.set("Демо: ожидаются 1 обновление, 3 новые строки, 1 пропуск.")
+        status.set("Демо ИФТ: 4 добавленные строки (включая 1 новую версию), 1 без изменений.")
 
     ttk.Label(outer, text="1. Основная матрица").grid(row=2, column=0, sticky="w", pady=(0, 6))
     matrix_row = ttk.Frame(outer)
@@ -79,11 +81,16 @@ def start(config_path=None):
     file_list.configure(yscrollcommand=scrollbar.set)
     actions = ttk.Frame(outer)
     actions.grid(row=6, column=0, sticky="w", pady=(8, 16))
+    ttk.Label(actions, text="Среда: ").pack(side="left")
+    for value, label in (("IFT", "ИФТ"), ("PROM", "ПРОМ")):
+        button = ttk.Radiobutton(actions, text=label, variable=environment_var, value=value)
+        button.pack(side="left", padx=(0, 8))
+        controls.append(button)
     for text, command in (("Добавить шаблоны…", pick_templates), ("Очистить", clear_templates), ("Загрузить демо", demo)):
         button = ttk.Button(actions, text=text, command=command)
         button.pack(side="left", padx=(0, 8))
         controls.append(button)
-    ttk.Label(outer, text="Результат сохраняется в новый файл. IFT и PROM заполняются вручную.\nФормулы пересчитаются при открытии результата в Р7-Офис или Excel.", style="Hint.TLabel", wraplength=740).grid(row=7, column=0, sticky="w", pady=(0, 18))
+    ttk.Label(outer, text="Меняется только выбранная среда. Байпас проверяется вручную.\nФормулы пересчитаются при открытии результата в Р7-Офис или Excel.", style="Hint.TLabel", wraplength=740).grid(row=7, column=0, sticky="w", pady=(0, 18))
     progress = ttk.Progressbar(outer, mode="indeterminate")
     progress.grid(row=8, column=0, sticky="ew", pady=(0, 8))
     ttk.Label(outer, textvariable=status, wraplength=740).grid(row=9, column=0, sticky="w", pady=(0, 14))
@@ -93,12 +100,16 @@ def start(config_path=None):
         if not matrix_var.get() or not files:
             messagebox.showinfo("Выберите файлы", "Нужны основная матрица и хотя бы один шаблон.")
             return
+        if not environment_var.get():
+            messagebox.showinfo("Выберите среду", "Укажите ИФТ или ПРОМ для задачи.")
+            return
         output = filedialog.asksaveasfilename(title="Новый файл результата", defaultextension=".xlsx",
                                             initialfile=f"matrix_result_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
                                             filetypes=[("Excel", "*.xlsx")], confirmoverwrite=True)
         if not output:
             return
         matrix, templates = matrix_var.get(), list(files)
+        environment = environment_var.get()
         busy = True
         for control in controls:
             control.configure(state="disabled")
@@ -106,7 +117,7 @@ def start(config_path=None):
 
         def worker():
             try:
-                result = import_files(matrix, templates, output, config_path, lambda text: events.put(("progress", text)))
+                result = import_files(matrix, templates, output, config_path, lambda text: events.put(("progress", text)), environment=environment)
                 events.put(("done", result))
             except Exception as exc:
                 events.put(("error", str(exc)))
@@ -130,6 +141,7 @@ def start(config_path=None):
                     control.configure(state="normal")
                 if kind == "done":
                     text = f"Добавлено: {value.added}. Обновлено: {value.updated}. Без изменений: {value.skipped}. На ручной разбор: {len(value.conflicts)}."
+                    text += f" Новых ИФТ-версий: {value.versioned}. Включено в ПРОМ: {value.promoted}; прежних ПРОМ-версий отключено: {value.prom_deactivated}. Среда: {value.environment}. Байпас проверьте вручную."
                     status.set(text)
                     details = "\n\n".join(value.conflicts)
                     messagebox.showinfo("Готово", f"{text}\n\nСохранено:\n{value.output}\n\n{details}")

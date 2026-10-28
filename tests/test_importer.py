@@ -21,7 +21,9 @@ class ImportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.folder = Path(self.tmp.name)
-        self.matrix = ROOT / "examples/01_matrix.xlsx"
+        # Прежние проверки преобразований используют строку только на ИФТ.
+        # Версионирование общей ИФТ/ПРОМ-строки проверяется отдельно.
+        self.matrix = self.change(ROOT / "examples/01_matrix.xlsx", lambda b: setattr(b.worksheets[0]['D2'], 'value', None), 'ift_matrix.xlsx')
         self.templates = [ROOT / "examples/02_template_update.xlsx", ROOT / "examples/03_template_new_group.xlsx"]
         self.output = self.folder / "result.xlsx"
 
@@ -38,7 +40,7 @@ class ImportTests(unittest.TestCase):
 
     def run_import(self, **kwargs):
         return import_files(kwargs.get("matrix", self.matrix), kwargs.get("templates", self.templates),
-                            kwargs.get("output", self.output), kwargs.get("config_path"))
+                            kwargs.get("output", self.output), kwargs.get("config_path"), environment=kwargs.get("environment", "IFT"))
 
     def test_demo_and_repeat_without_cached_formula_values(self):
         hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in [self.matrix, *self.templates]}
@@ -60,11 +62,11 @@ class ImportTests(unittest.TestCase):
             for row in (4, 5):
                 self.assertEqual([c.value for c in a[row]], [c.value for c in b[row]])
             self.assertEqual(b['AK2'].value, 'Новое тестовое сообщение. Повторите операцию позже.')
-            self.assertEqual(b['AL6'].value, 'ТЗ')
+            self.assertIsNone(b['AL6'].value)
             self.assertIsNone(b['AL8'].value)
             self.assertEqual(b['A6'].value, '=ROW(A7)-2')
             self.assertIn('MATCH(G6,', b['H6'].value)
-            self.assertIsNone(b['C6'].value)
+            self.assertEqual(b['C6'].value, 1)
             self.assertIsNone(b['D6'].value)
             self.assertIsNone(b['B6'].value)
             self.assertEqual(b.tables['MatrixTable'].ref, 'A1:AQ8')
@@ -116,17 +118,17 @@ class ImportTests(unittest.TestCase):
         before.close()
         after.close()
 
-    def test_unknown_bypass(self):
+    def test_unknown_bypass_is_ignored(self):
         bad = self.change(self.templates[0], lambda b: setattr(b.worksheets[0]['Q18'], 'value', 'неизвестно'), 'bypass.xlsx')
-        with self.assertRaisesRegex(ImportProblem, 'Байпас'):
-            self.run_import(templates=[bad])
+        result = self.run_import(templates=[bad])
+        self.assertEqual((result.added, result.updated, result.skipped), (1, 1, 1))
 
-    def test_bypass_clears_previous_forbidden_value(self):
+    def test_bypass_preserves_previous_forbidden_value(self):
         matrix = self.change(self.matrix, lambda b: setattr(b.worksheets[0]['AL2'], 'value', 'ТЗ'), 'bypass_matrix.xlsx')
         result = self.run_import(matrix=matrix, templates=[self.templates[0]])
         self.assertEqual(result.updated, 1)
         b = load_workbook(self.output)
-        self.assertIsNone(b.worksheets[0]['AL2'].value)
+        self.assertEqual(b.worksheets[0]['AL2'].value, 'ТЗ')
         b.close()
 
     def test_required_field(self):
@@ -183,7 +185,7 @@ class ImportTests(unittest.TestCase):
         matrix = self.change(self.matrix, matrix_edit, 'office.xlsx')
         template = self.change(self.templates[0], template_edit, 'office_template.xlsx')
         r = self.run_import(matrix=matrix, templates=[template])
-        self.assertEqual((r.added, r.updated, r.skipped), (1, 2, 0))
+        self.assertEqual((r.added, r.updated, r.skipped), (1, 1, 1))
 
     def test_input_and_existing_output_never_overwritten(self):
         before = self.matrix.read_bytes()

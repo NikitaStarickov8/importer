@@ -48,6 +48,7 @@ class Job:
     folder: Path
     manifest: list
     paths: list
+    environment: str
     uploaded: set = field(default_factory=set)
     uploading: set = field(default_factory=set)
     state: str = "uploading"
@@ -71,6 +72,9 @@ class AppState:
     def create_job(self, data):
         if not isinstance(data, dict):
             raise RequestProblem("Ожидается описание матрицы и шаблонов.")
+        environment = data.get("environment")
+        if environment not in ("IFT", "PROM"):
+            raise RequestProblem("Выберите среду задачи: ИФТ или ПРОМ.")
         templates = data.get("templates")
         if not isinstance(templates, list) or not 1 <= len(templates) <= MAX_TEMPLATES:
             raise RequestProblem("Выберите от 1 до 500 шаблонов.")
@@ -92,7 +96,7 @@ class AppState:
             folder.mkdir()
             # Номера защищают от одинаковых имён и совпадения с именем результата.
             paths = [folder / f"{i:03d}_{item['name'][:-5].encode('utf-8')[:160].decode('utf-8', errors='ignore')}.xlsx" for i, item in enumerate(manifest)]
-            job = Job(ident, folder, manifest, paths)
+            job = Job(ident, folder, manifest, paths, environment)
             self.jobs[ident] = job
             return job
 
@@ -104,7 +108,7 @@ class AppState:
 
     def describe(self, job):
         with self.lock:
-            result = {"id": job.id, "state": job.state, "message": job.message}
+            result = {"id": job.id, "state": job.state, "message": job.message, "environment": job.environment}
             if job.error:
                 result["error"] = job.error
             if job.counts is not None:
@@ -128,11 +132,11 @@ class AppState:
             with self.lock:
                 job.message = message
         try:
-            result = import_files(job.paths[0], job.paths[1:], job.folder / "result.xlsx", self.config_path, progress)
+            result = import_files(job.paths[0], job.paths[1:], job.folder / "result.xlsx", self.config_path, progress, environment=job.environment)
             with self.lock:
-                job.counts = {"added": result.added, "updated": result.updated, "skipped": result.skipped, "conflicted": len(result.conflicts), "total": result.total}
+                job.counts = {"added": result.added, "updated": result.updated, "skipped": result.skipped, "conflicted": len(result.conflicts), "versioned": result.versioned, "promoted": result.promoted, "prom_deactivated": result.prom_deactivated, "total": result.total}
                 job.conflicts = result.conflicts
-                job.filename = f"matrix_result_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+                job.filename = f"matrix_result_{job.environment}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
                 job.state, job.message = "done", "Импорт завершён"
         except Exception as exc:
             if isinstance(exc, BadZipFile):
@@ -146,12 +150,12 @@ class AppState:
         return all((self.examples_root / name).is_file() for name in (
             "01_matrix.xlsx", "02_template_update.xlsx", "03_template_new_group.xlsx"))
 
-    def demo(self):
+    def demo(self, environment="IFT"):
         if not self.demo_available():
             raise RequestProblem("Папка examples не перенесена. Выберите свои файлы.", 404)
         sources = [self.examples_root / name for name in ("01_matrix.xlsx", "02_template_update.xlsx", "03_template_new_group.xlsx")]
         items = [{"name": p.name, "size": p.stat().st_size} for p in sources]
-        job = self.create_job({"matrix": items[0], "templates": items[1:]})
+        job = self.create_job({"matrix": items[0], "templates": items[1:], "environment": environment})
         for i, (source, target) in enumerate(zip(sources, job.paths)):
             shutil.copyfile(source, target)
             job.uploaded.add(i)
@@ -175,7 +179,7 @@ class LocalServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MatrixImporter/0.2.4"
+    server_version = "MatrixImporter/0.3.1"
     protocol_version = "HTTP/1.0"
 
     def log_message(self, *_):
@@ -268,12 +272,14 @@ class Handler(BaseHTTPRequestHandler):
             name, mime = assets[path]
             return self._send(200, (ASSETS / name).read_bytes(), mime)
         if method == "GET" and path == "/api/info":
-            return self._send(200, {"demo": app.demo_available(), "version": "0.2.4"})
+            return self._send(200, {"demo": app.demo_available(), "version": "0.3.1"})
         if method == "POST" and path == "/api/jobs":
             return self._send(201, app.describe(app.create_job(self._json())))
         if method == "POST" and path == "/api/demo":
-            self._json()
-            return self._send(202, app.describe(app.demo()))
+            data = self._json()
+            if not isinstance(data, dict):
+                raise RequestProblem("Ожидается выбор среды задачи.")
+            return self._send(202, app.describe(app.demo(data.get("environment", "IFT"))))
         if len(parts) >= 3 and parts[:2] == ["api", "jobs"]:
             job = app.get_job(parts[2])
             if method == "GET" and len(parts) == 3:
@@ -340,7 +346,7 @@ def start(config_path=None, port=8765, open_browser=True):
                 raise
             server = LocalServer(0, app)
         url = f"http://127.0.0.1:{server.server_port}"
-        print(f"MatrixImporter 0.2.4\nОткройте в браузере: {url}\nДля завершения нажмите Ctrl+C в этом терминале.", flush=True)
+        print(f"MatrixImporter 0.3.1\nОткройте в браузере: {url}\nДля завершения нажмите Ctrl+C в этом терминале.", flush=True)
         if open_browser:
             def launch_browser():
                 try:

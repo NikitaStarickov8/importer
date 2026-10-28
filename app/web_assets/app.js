@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const token = document.querySelector('meta[name="matrix-token"]').content;
 let matrix = null, templates = [], busy = false, currentResult = null;
-const controls = [$("matrix-file"), $("template-files"), $("run"), $("demo")];
+const controls = [$("matrix-file"), $("template-files"), $("environment"), $("run"), $("demo")];
 
 function sizeLabel(bytes) { return bytes < 1024 * 1024 ? `${Math.ceil(bytes/1024)} КБ` : `${(bytes/1024/1024).toFixed(1)} МБ`; }
 function clearResult() { currentResult = null; $("status-panel").hidden = true; }
@@ -20,7 +20,7 @@ function refresh() {
     item.append(label, remove); list.append(item);
   });
   controls.forEach(control => control.disabled = busy);
-  $("run").disabled = busy || !matrix || !templates.length;
+  $("run").disabled = busy || !matrix || !templates.length || !$("environment").value;
 }
 function setBusy(value) { busy = value; refresh(); }
 function status(message, state = "running") {
@@ -57,6 +57,9 @@ async function watch(id) {
       currentResult = job;
       const conflicts = job.conflicts || [];
       status(conflicts.length ? "Импорт завершён с пропусками. Конфликтующие записи не изменены и не добавлены; проверьте список для ручного разбора. Остальные изменения сохранены." : "Все выбранные шаблоны обработаны. Скачайте обновлённую матрицу.", "done");
+      $("status-message").textContent += job.environment === "PROM"
+        ? ` Среда: ПРОМ. Включено готовых ИФТ-строк: ${job.counts.promoted}; у прежних ПРОМ-версий снята отметка: ${job.counts.prom_deactivated}. Новые строки и изменения содержимого в ПРОМ-задаче не создаются. Байпас сохранён.`
+        : ` Среда: ИФТ. Из добавленных строк новых версий: ${job.counts.versioned}; у старых снята только отметка ИФТ. Байпас проверьте вручную.`;
       for (const field of ["added", "updated", "skipped", "conflicted"]) $(field).textContent = job.counts[field];
       if (conflicts.length) {
         $("status-badge").textContent = "Есть пропуски";
@@ -88,13 +91,13 @@ $("template-files").addEventListener("change", event => {
   event.target.value = "";
 });
 $("run").addEventListener("click", async () => {
-  if (busy || !matrix || !templates.length) return;
+  if (busy || !matrix || !templates.length || !$("environment").value) return;
   setBusy(true); currentResult = null;
   try {
     const files = [matrix, ...templates];
     if (files.reduce((sum, f) => sum + f.size, 0) > 512*1024*1024) throw new Error("Общий объём файлов превышает 512 МБ.");
     status("Подготавливаю файлы…");
-    const job = await post("/api/jobs", {matrix:fileInfo(matrix), templates:templates.map(fileInfo)});
+    const job = await post("/api/jobs", {matrix:fileInfo(matrix), templates:templates.map(fileInfo), environment:$("environment").value});
     for (let i=0; i<files.length; i++) {
       status(`Передаю локальной программе файл ${i+1} из ${files.length}: ${files[i].name}`);
       await api(`/api/jobs/${job.id}/files/${i}`, {method:"PUT", headers:{"Content-Type":"application/octet-stream"}, body:files[i]});
@@ -106,11 +109,13 @@ $("run").addEventListener("click", async () => {
 });
 $("demo").addEventListener("click", async () => {
   if (busy) return;
+  if (!$("environment").value) $("environment").value = "IFT";
   setBusy(true); currentResult = null; status("Обрабатываю искусственные примеры…");
-  try { const job = await post("/api/demo"); await watch(job.id); }
+  try { const job = await post("/api/demo", {environment:$("environment").value}); await watch(job.id); }
   catch (error) { status(error.message, "error"); }
   finally { setBusy(false); }
 });
+$("environment").addEventListener("change", () => { clearResult(); refresh(); });
 $("download").addEventListener("click", async () => {
   if (!currentResult) return;
   const result = currentResult;

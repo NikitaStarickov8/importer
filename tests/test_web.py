@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'vendor'), str(ROOT)]
 from openpyxl import load_workbook
 from app.web import AppState, LocalServer, MAX_FILE
+from app.importer import import_files
 
 
 class WebTests(unittest.TestCase):
@@ -53,12 +54,12 @@ class WebTests(unittest.TestCase):
         code, data, _ = self.request(method, path, body, **kwargs)
         return code, json.loads(data)
 
-    def create(self, matrix=None, templates=None):
+    def create(self, matrix=None, templates=None, environment='IFT'):
         matrix = matrix or self.matrix.read_bytes()
         templates = templates or [p.read_bytes() for p in self.templates]
         files = [matrix, *templates]
         manifest = [{'name': f'потреба_{i}.xlsx', 'size':len(data)} for i, data in enumerate(files)]
-        code, job = self.json_request('POST', '/api/jobs', {'matrix':manifest[0], 'templates':manifest[1:]})
+        code, job = self.json_request('POST', '/api/jobs', {'matrix':manifest[0], 'templates':manifest[1:], 'environment':environment})
         self.assertEqual(code, 201, job)
         ident = job['id']
         for index, data in enumerate(files):
@@ -93,19 +94,24 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.json_request('POST',f'/api/jobs/{ident}/start',{})[0],202)
         job = self.wait(ident)
         self.assertEqual(job['state'],'done',job)
-        self.assertEqual(job['counts'],{'added':3,'updated':1,'skipped':1,'conflicted':0,'total':5})
+        self.assertEqual(job['counts'],{'added':4,'updated':0,'skipped':1,'conflicted':0,'versioned':1,'promoted':0,'prom_deactivated':0,'total':5})
+        self.assertEqual(job['environment'], 'IFT')
         self.assertEqual(job['conflicts'], [])
         code, payload, headers = self.request('GET',job['download_url'])
         self.assertEqual(code,200)
         self.assertIn('attachment',headers['Content-Disposition'])
         workbook = load_workbook(io.BytesIO(payload))
-        self.assertEqual(workbook.worksheets[0].max_row,8)
-        self.assertEqual(workbook.worksheets[0]['AL6'].value,'ТЗ')
+        self.assertEqual(workbook.worksheets[0].max_row,9)
+        self.assertIsNone(workbook.worksheets[0]['AL6'].value)
+        self.assertIsNone(workbook.worksheets[0]['C2'].value)
+        self.assertEqual(workbook.worksheets[0]['D2'].value, 1)
+        self.assertEqual(workbook.worksheets[0]['C6'].value, 1)
+        self.assertIsNone(workbook.worksheets[0]['D6'].value)
         self.assertEqual(workbook.worksheets[0]['A6'].value,'=ROW(A7)-2')
         workbook.close()
         second = self.create(matrix=payload)
         self.json_request('POST',f'/api/jobs/{second}/start',{})
-        self.assertEqual(self.wait(second)['counts'],{'added':0,'updated':0,'skipped':5,'conflicted':0,'total':5})
+        self.assertEqual(self.wait(second)['counts'],{'added':0,'updated':0,'skipped':5,'conflicted':0,'versioned':0,'promoted':0,'prom_deactivated':0,'total':5})
         self.assertEqual(hashlib.sha256(self.matrix.read_bytes()).hexdigest(),original)
 
     def test_demo(self):
@@ -113,7 +119,7 @@ class WebTests(unittest.TestCase):
         code, response = self.json_request('POST','/api/demo',{})
         self.assertEqual(code,202)
         job = self.wait(response['id'])
-        self.assertEqual(job['counts']['added'],3)
+        self.assertEqual(job['counts']['added'],4)
 
     def test_partial_result_has_conflict_details_and_can_be_downloaded(self):
         book = load_workbook(self.matrix)
@@ -127,7 +133,7 @@ class WebTests(unittest.TestCase):
         self.json_request('POST', f'/api/jobs/{ident}/start', {})
         job = self.wait(ident)
         self.assertEqual(job['state'], 'done', job)
-        self.assertEqual(job['counts'], {'added':3, 'updated':0, 'skipped':1, 'conflicted':1, 'total':5})
+        self.assertEqual(job['counts'], {'added':3, 'updated':0, 'skipped':1, 'conflicted':1, 'versioned':0, 'promoted':0,'prom_deactivated':0,'total':5})
         self.assertEqual(len(job['conflicts']), 1)
         self.assertIn('[2, 6]', job['conflicts'][0])
         code, payload, _ = self.request('GET', job['download_url'])
@@ -147,7 +153,7 @@ class WebTests(unittest.TestCase):
 
     def test_incomplete_upload_cannot_start(self):
         data={'name':'matrix.xlsx','size':10}
-        _, job = self.json_request('POST','/api/jobs',{'matrix':data,'templates':[data]})
+        _, job = self.json_request('POST','/api/jobs',{'matrix':data,'templates':[data], 'environment':'IFT'})
         code, _ = self.json_request('POST',f'/api/jobs/{job["id"]}/start',{})
         self.assertEqual(code,409)
         self.assertEqual(self.request('GET',f'/api/jobs/{job["id"]}/download')[0],409)
@@ -155,12 +161,12 @@ class WebTests(unittest.TestCase):
     def test_invalid_names_and_sizes(self):
         valid={'name':'ok.xlsx','size':1}
         for bad in [{'name':'../bad.xlsx','size':1}, {'name':'file.xls','size':1}, {'name':'file.xlsx','size':0}, {'name':'file.xlsx','size':MAX_FILE+1}]:
-            code,_=self.json_request('POST','/api/jobs',{'matrix':bad,'templates':[valid]})
+            code,_=self.json_request('POST','/api/jobs',{'matrix':bad,'templates':[valid], 'environment':'IFT'})
             self.assertEqual(code,400)
 
     def test_wrong_upload_size_and_duplicate_upload(self):
         item={'name':'ok.xlsx','size':4}
-        _,job=self.json_request('POST','/api/jobs',{'matrix':item,'templates':[item]})
+        _,job=self.json_request('POST','/api/jobs',{'matrix':item,'templates':[item], 'environment':'IFT'})
         path=f'/api/jobs/{job["id"]}/files/0'
         self.assertEqual(self.request('PUT',path,b'123')[0],400)
         self.assertEqual(self.request('PUT',path,b'1234')[0],200)
@@ -179,6 +185,45 @@ class WebTests(unittest.TestCase):
         with patch.dict(sys.modules,{'tkinter':None,'_tkinter':None}), patch.object(sys,'argv',['run.py','--no-browser']), patch('app.web.start') as start:
             self.assertEqual(run.main(),0)
             start.assert_called_once_with(None,8765,open_browser=False)
+
+    def test_environment_is_required_for_real_uploads(self):
+        item = {'name':'ok.xlsx', 'size':1}
+        for environment in (None, '', 'BOTH', 1):
+            code, response = self.json_request('POST', '/api/jobs', {'matrix':item, 'templates':[item], 'environment':environment})
+            self.assertEqual(code, 400)
+            self.assertIn('среду', response['error'])
+
+    def test_prom_import_activates_ready_ift_without_adding_rows(self):
+        prepared = Path(self.state.temp.name) / 'ready_ift.xlsx'
+        import_files(self.matrix, self.templates, prepared, environment='IFT')
+        ident = self.create(matrix=prepared.read_bytes(), environment='PROM')
+        self.json_request('POST', f'/api/jobs/{ident}/start', {})
+        job = self.wait(ident)
+        self.assertEqual(job['state'], 'done', job)
+        self.assertEqual(job['environment'], 'PROM')
+        self.assertEqual(job['counts'], {'added':0, 'updated':5, 'skipped':0, 'conflicted':0, 'versioned':0, 'promoted':5, 'prom_deactivated':1,'total':5})
+        code, payload, headers = self.request('GET', job['download_url'])
+        self.assertEqual(code, 200)
+        self.assertIn('_PROM_', headers['Content-Disposition'])
+        book = load_workbook(io.BytesIO(payload))
+        sheet = book.worksheets[0]
+        self.assertIsNone(sheet['C2'].value)
+        self.assertIsNone(sheet['D2'].value)
+        self.assertEqual(sheet['C6'].value, 1)
+        self.assertEqual(sheet['D6'].value, 1)
+        self.assertEqual(sheet.max_row, 9)
+        book.close()
+        second = self.create(matrix=payload, environment='PROM')
+        self.json_request('POST', f'/api/jobs/{second}/start', {})
+        repeat = self.wait(second)
+        self.assertEqual((repeat['counts']['added'], repeat['counts']['updated'], repeat['counts']['skipped']), (0, 0, 5))
+
+    def test_cli_requires_explicit_environment(self):
+        import run
+        with patch.object(sys, 'argv', ['run.py', '--matrix', 'm.xlsx', '--templates', 't.xlsx', '--output', 'o.xlsx']):
+            with patch('sys.stderr', new=io.StringIO()), self.assertRaises(SystemExit) as error:
+                run.main()
+            self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == '__main__':

@@ -19,6 +19,8 @@ from openpyxl.workbook.properties import CalcProperties
 from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
 
 ROOT = Path(__file__).resolve().parent.parent
+MUTABLE_FIELDS = ("VALUE", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT")
+DEFAULT_TRANSACTION_DESCRIPTION = "Не финансовые операции"
 
 
 class ImportProblem(Exception):
@@ -41,6 +43,19 @@ def header(value):
 
 def blank(value):
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+def transaction_default(config):
+    value = config.get("transaction_type_default_description", DEFAULT_TRANSACTION_DESCRIPTION)
+    if not isinstance(value, str) or blank(value):
+        raise ImportProblem("transaction_type_default_description: требуется непустое описание типа транзакции.")
+    return value
+
+
+def validate_environment(environment):
+    if environment not in ("IFT", "PROM"):
+        raise ImportProblem("Выберите среду задачи: ИФТ (IFT) или ПРОМ (PROM).")
+    return environment
 
 
 def formula(value):
@@ -275,6 +290,8 @@ def canonical(raw, catalog, config, source, require_payload=True):
         code_value = raw.get(name)
         desc_value = raw.get(description) if name != "VALUE" else None
         value = code_value if not blank(code_value) else desc_value
+        if name == "TRANSACTION_TYPE" and blank(value):
+            value = transaction_default(config)
         if blank(value):
             if name in required:
                 raise ImportProblem(f"Не заполнено обязательное поле {name}.")
@@ -399,7 +416,6 @@ def parse_template(path, catalog, config, conflicts=None):
         known.update({header(v["description_field"]): v["description_field"] for k, v in config["lookups"].items() if k != "VALUE"})
         for field in ("VALUE", "MAX_AMOUNT", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT"):
             known[header(field)] = field
-        bypass_col = cols.get(header("Поле Байпас"))
         for row in range(max(header_row + 1, config["template_data_start_row"]), sheet.max_row + 1):
             value_col = cols["VALUE"]
             signals = [sheet.cell(row, cols[x]).value for x in marker_fields]
@@ -413,15 +429,6 @@ def parse_template(path, catalog, config, conflicts=None):
                 raw["VALUE"] = template_value(sheet.cell(row, value_col))
                 raw["TITLE_FOR_CLIENT"] = raw.get("TITLE_FOR_CLIENT")
                 raw["TEXT_FOR_CLIENT"] = raw.get("TEXT_FOR_CLIENT")
-                if bypass_col:
-                    bypass = template_value(sheet.cell(row, bypass_col))
-                    mapping = {norm(k): v for k, v in config["bypass_values"].items()}
-                    if blank(bypass):
-                        raw[config["bypass_target"]] = None
-                    elif norm(bypass) in mapping:
-                        raw[config["bypass_target"]] = mapping[norm(bypass)]
-                    else:
-                        raise ImportProblem(f"Неизвестное значение поля Байпас: «{bypass}».")
                 result.append(canonical(raw, catalog, config, source))
             except AmbiguousLookup as exc:
                 if conflicts is None:
@@ -446,6 +453,9 @@ def read_matrix_row(sheet, cols, row, catalog, config):
                     cell = sheet.cell(row, cols[header(f)])
                     if cell.data_type != "f":
                         raw[f] = literal(cell)
+                    elif field == "TRANSACTION_TYPE" and f == desc:
+                        # Формула — не пустая ячейка. Не подменяем её значением по умолчанию.
+                        raw[f] = template_value(cell)
         elif header(field) in cols:
             raw[field] = literal(sheet.cell(row, cols[header(field)]))
     return canonical(raw, catalog, config, f"{sheet.title}!{row}", require_payload=False)
@@ -466,6 +476,13 @@ def uncertain_constraints(sheet, cols, row, catalog, config):
             cell = sheet.cell(row, cols[header(f)])
             if cell.data_type == "f":
                 has_formula = True
+                if name == "TRANSACTION_TYPE" and f != name:
+                    try:
+                        value = template_value(cell)
+                        if not blank(value):
+                            values.append(value)
+                    except ImportProblem:
+                        unreadable = True
                 continue
             try:
                 value = literal(cell)
@@ -475,6 +492,8 @@ def uncertain_constraints(sheet, cols, row, catalog, config):
                 unreadable = True
         if unreadable:
             choices = None
+        elif not values and name == "TRANSACTION_TYPE":
+            choices = catalog.possible_codes(name, transaction_default(config))
         elif not values:
             choices = None if name in required or has_formula else {""}
         elif name in config["lookups"]:
@@ -509,7 +528,7 @@ def payload(record, cols, config):
             result[desc] = record.values.get(desc)
         if header(field) in cols:
             result[field] = record.values.get(field)
-    for field in ("VALUE", "MAX_AMOUNT", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT", config["bypass_target"]):
+    for field in ("VALUE", "MAX_AMOUNT", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT"):
         if field in record.values:
             result[field] = record.values[field]
     return result
@@ -548,7 +567,7 @@ def grow_ranges(sheet, old_end, new_end, start):
                 sheet.conditional_formatting.add(new, rule)
 
 
-def append_row(sheet, cols, row, proto, values, config):
+def append_row(sheet, cols, row, proto, values, config, copy_constants=False):
     for col in range(1, sheet.max_column + 1):
         src, dst = sheet.cell(proto, col), sheet.cell(row, col)
         dst._style = copy(src._style)
@@ -557,8 +576,15 @@ def append_row(sheet, cols, row, proto, values, config):
             if not isinstance(src.value, str):
                 raise ImportProblem(f"{src.coordinate}: массивная формула не поддерживается прототипом.")
             dst.value = Translator(src.value, origin=src.coordinate).translate_formula(dst.coordinate)
+        elif copy_constants:
+            dst.value = copy(src.value)
+            dst.data_type = src.data_type
+        if copy_constants:
+            dst.comment = copy(src.comment)
+            if src.hyperlink:
+                dst.hyperlink = copy(src.hyperlink)
     sheet.row_dimensions[row].height = sheet.row_dimensions[proto].height
-    for field, value in config["new_row_defaults"].items():
+    for field, value in ({} if copy_constants else config["new_row_defaults"]).items():
         if header(field) in cols:
             text_write(sheet.cell(row, cols[header(field)]), value)
     # Если CODE хранится числом, а не формулой, используем последовательность строк.
@@ -566,8 +592,54 @@ def append_row(sheet, cols, row, proto, values, config):
         sheet.cell(row, cols["CODE"], row - config["matrix_header_row"])
     for field, value in values.items():
         cell = sheet.cell(row, cols[header(field)])
-        if cell.data_type != "f":
+        if cell.data_type != "f" or field in ("IFT", "PROM"):
             text_write(cell, value)
+    # Байпас никогда не переносится из шаблона или старой версии.
+    bypass = header(config.get("bypass_target", "VALUE_SWITCH"))
+    if bypass in cols:
+        text_write(sheet.cell(row, cols[bypass]), None)
+
+
+def flag_value(cell):
+    value = literal(cell)
+    normalized = value.strip() if isinstance(value, str) else value
+    if blank(value) or (not isinstance(value, bool) and normalized in (0, "0")):
+        return 0
+    if not isinstance(value, bool) and normalized in (1, "1"):
+        return 1
+    raise ImportProblem(f"{cell.coordinate}: отметка IFT/PROM должна быть 1, 0 или пустой; найдено «{value}».")
+
+
+def row_mode(sheet, cols, row, environment):
+    if not flag_value(sheet.cell(row, cols[environment])):
+        return "inactive"
+    if environment == "PROM":
+        return "promotion"
+    return "version" if flag_value(sheet.cell(row, cols["PROM"])) else "inplace"
+
+
+def payload_changes(sheet, cols, row, values):
+    changes, unsafe = {}, []
+    for name in MUTABLE_FIELDS:
+        cell = sheet.cell(row, cols[header(name)])
+        if cell.data_type in ("f", "e"):
+            unsafe.append(name)
+            continue
+        current, value = cell.value, values[name]
+        equal = (blank(current) and blank(value)) or (type(current) == type(value) and current == value)
+        if isinstance(current, (int, float)) and not isinstance(current, bool) and isinstance(value, (int, float)) and not isinstance(value, bool):
+            equal = current == value
+        if not equal:
+            changes[name] = value
+    return changes, unsafe
+
+
+@dataclass
+class Plan:
+    row: int
+    values: dict
+    prototype: int | None = None
+    old_version: int | None = None
 
 
 @dataclass
@@ -578,9 +650,14 @@ class Result:
     total: int = 0
     output: str = ""
     conflicts: list[str] = field(default_factory=list)
+    versioned: int = 0
+    environment: str = "IFT"
+    promoted: int = 0
+    prom_deactivated: int = 0
 
 
-def import_files(matrix, templates, output, config_path=None, progress: Callable[[str], None] = lambda _: None):
+def import_files(matrix, templates, output, config_path=None, progress: Callable[[str], None] = lambda _: None, environment="IFT"):
+    environment = validate_environment(environment)
     config = load_config(config_path)
     matrix, output = Path(matrix).resolve(), Path(output).resolve()
     templates = [Path(p).resolve() for p in templates]
@@ -603,7 +680,7 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
         if sheet.protection.sheet:
             raise ImportProblem("Основной лист защищён от изменений.")
         cols = columns_at(sheet, config["matrix_header_row"])
-        needed = {"VALUE", "MAX_AMOUNT", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT", config["bypass_target"]}
+        needed = {"VALUE", "MAX_AMOUNT", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT", "IFT", "PROM"}
         for field, spec in config["lookups"].items():
             if field != "VALUE":
                 needed.add(spec["description_field"])
@@ -621,10 +698,12 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                 if str(exc).startswith(f"{path.name}, "):
                     raise
                 raise ImportProblem(f"{path.name}: {exc}") from exc
-        result = Result(total=len(incoming) + len(conflicts), output=str(output), conflicts=conflicts)
+        result = Result(total=len(incoming) + len(conflicts), output=str(output), conflicts=conflicts, environment=environment)
         progress("Сопоставляю записи матрицы…")
         index = defaultdict(list)
+        prom_index = defaultdict(list)
         uncertain = []
+        modes = {}
         last = config["matrix_header_row"]
         for row in range(last + 1, sheet.max_row + 1):
             # Предзаполненные формулы ниже данных не считаем записями.
@@ -633,11 +712,26 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                 continue
             last = row
             try:
+                if environment == "PROM":
+                    ift_active = flag_value(sheet.cell(row, cols["IFT"]))
+                    prom_active = flag_value(sheet.cell(row, cols["PROM"]))
+                    mode = "promotion" if ift_active or prom_active else "inactive"
+                else:
+                    mode = row_mode(sheet, cols, row, environment)
+                if mode == "inactive":
+                    continue
                 record = read_matrix_row(sheet, cols, row, catalog, config)
             except ImportProblem as exc:
                 uncertain.append((row, uncertain_constraints(sheet, cols, row, catalog, config), str(exc)))
             else:
-                index[record.key(config)].append(row)
+                if environment == "PROM":
+                    if ift_active:
+                        index[record.key(config)].append(row)
+                    if prom_active:
+                        prom_index[record.key(config)].append(row)
+                else:
+                    index[record.key(config)].append(row)
+                modes[row] = mode
             if row % 5000 == 0:
                 progress(f"Проверено строк матрицы: {row:,}")
         old_end = last
@@ -648,7 +742,7 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
         for record in incoming:
             key = record.key(config)
             values = payload(record, cols, config)
-            signature = tuple(sorted((k, None if blank(v) else v) for k, v in values.items()))
+            signature = tuple((k, None if blank(values[k]) else values[k]) for k in MUTABLE_FIELDS)
             if key in signatures and signatures[key] != signature:
                 template_conflicts.add(key)
             signatures[key] = signature
@@ -663,10 +757,13 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
             if key not in uncertain_matches:
                 uncertain_matches[key] = [(row, reason) for row, constraints, reason in uncertain if could_match(record, constraints, config)]
             unclear = uncertain_matches[key]
-            if len(matches) > 1 or unclear:
+            prom_matches = prom_index.get(key, [])
+            if (environment == "IFT" and len(matches) > 1) or len(prom_matches) > 1 or unclear:
                 reasons = []
                 if len(matches) > 1:
-                    reasons.append(f"в матрице несколько подходящих строк: {matches[:10]}")
+                    reasons.append(f"в матрице несколько подходящих строк{' ИФТ' if environment == 'PROM' else ''}: {matches[:10]}")
+                if len(prom_matches) > 1:
+                    reasons.append(f"в матрице несколько активных строк ПРОМ: {prom_matches[:10]}")
                 if unclear:
                     reasons.append("возможное совпадение с неразобранными строками матрицы: " + "; ".join(f"{row} ({reason})" for row, reason in unclear[:3]))
                 result.conflicts.append(f"{record.source}: {'; '.join(reasons)}. Строка пропущена; требуется ручной разбор.")
@@ -674,49 +771,90 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
             if key in seen:
                 result.skipped += 1
                 continue
-            seen.add(key)
+            if environment == "PROM":
+                current_prom = prom_matches[0] if prom_matches else None
+                ready, unreadable = [], []
+                for candidate in matches:
+                    candidate_changes, candidate_unsafe = payload_changes(sheet, cols, candidate, values)
+                    if candidate_unsafe:
+                        unreadable.append(candidate)
+                    elif not candidate_changes:
+                        ready.append(candidate)
+                if len(ready) > 1 or unreadable:
+                    reason = f"несколько ИФТ-строк с одинаковыми ключом и содержимым: {ready[:10]}" if len(ready) > 1 else f"содержимое ИФТ-строк нельзя проверить: {unreadable[:10]}"
+                    result.conflicts.append(f"{record.source}: {reason}. Отметки не изменены; требуется ручной разбор.")
+                    continue
+                already_deployed = False
+                if current_prom is not None:
+                    current_changes, unsafe = payload_changes(sheet, cols, current_prom, values)
+                    already_deployed = not current_changes and not unsafe
+                    if already_deployed and (not ready or ready[0] == current_prom):
+                        seen.add(key)
+                        result.skipped += 1
+                        continue
+                if not ready:
+                    reason = "нет активной ИФТ-строки" if not matches else f"содержимое активных ИФТ-строк {matches[:10]} не совпадает с шаблоном"
+                    result.conflicts.append(f"{record.source}: {reason} для включения в ПРОМ. Ничего не изменено; требуется ручной разбор.")
+                    continue
+                row = ready[0]
+                # В ПРОМ переносится готовая ИФТ-версия. Её данные и байпас
+                # не переписываются, новые строки здесь не создаются.
+                plans.append(Plan(row, {"PROM": 1}, old_version=current_prom))
+                seen.add(key)
+                result.updated += 1
+                result.promoted += 1
+                if current_prom is not None:
+                    result.prom_deactivated += 1
+                continue
             if matches:
                 row = matches[0]
-                changes = {}
-                for field, value in values.items():
-                    cell = sheet.cell(row, cols[header(field)])
-                    if cell.data_type == "f":
-                        # Формулы кодов остаются; входные поля должны быть редактируемыми.
-                        if field not in config["lookups"]:
-                            raise ImportProblem(f"{record.source}: поле {field} в матрице вычисляется формулой; автоматическая замена запрещена.")
-                        continue
-                    current = cell.value
-                    equal = (blank(current) and blank(value)) or (type(current) == type(value) and current == value)
-                    if isinstance(current, (int, float)) and not isinstance(current, bool) and isinstance(value, (int, float)) and not isinstance(value, bool):
-                        equal = current == value
-                    if not equal:
-                        changes[field] = value
+                # Ключи и прочие столбцы существующей записи не редактируются.
+                changes, unsafe = payload_changes(sheet, cols, row, values)
+                if unsafe:
+                    result.conflicts.append(f"{record.source}: поля {', '.join(unsafe)} в строке матрицы {row} вычисляются формулой. Строка пропущена; требуется ручной разбор.")
+                    continue
+                seen.add(key)
                 if changes:
-                    plans.append((row, changes, False))
-                    result.updated += 1
+                    if modes[row] == "version":
+                        last += 1
+                        version_values = dict(changes)
+                        for field in ("TRANSACTION_TYPE", config["lookups"]["TRANSACTION_TYPE"]["description_field"]):
+                            cell = sheet.cell(row, cols[header(field)])
+                            if cell.data_type != "f" and blank(cell.value):
+                                version_values[field] = record.values.get(field)
+                        version_values.update(IFT=1 if environment == "IFT" else None, PROM=1 if environment == "PROM" else None)
+                        plans.append(Plan(last, version_values, prototype=row, old_version=row))
+                        result.added += 1
+                        result.versioned += 1
+                    else:
+                        plans.append(Plan(row, changes))
+                        result.updated += 1
                 else:
                     result.skipped += 1
             else:
+                seen.add(key)
                 last += 1
-                plans.append((last, values, True))
+                values.update(IFT=1 if environment == "IFT" else None, PROM=1 if environment == "PROM" else None)
+                plans.append(Plan(last, values, prototype=config["prototype_row"]))
                 result.added += 1
         proto = config["prototype_row"]
         if proto <= config["matrix_header_row"] or proto > old_end:
             raise ImportProblem("В матрице нет образцовой строки для копирования формул и оформления.")
-        # Проверяем отсутствие вычислений во входных столбцах до добавления строк.
-        if incoming:
-            for field_name in payload(incoming[0], cols, config):
-                if field_name not in config["lookups"] and sheet.cell(proto, cols[header(field_name)]).data_type == "f":
-                    raise ImportProblem(f"Образцовая строка: входное поле {field_name} содержит формулу.")
         progress("Записываю изменения и сохраняю новый файл…")
-        for row, values, is_new in plans:
-            if is_new:
+        for plan in plans:
+            row, values = plan.row, plan.values
+            if plan.prototype is not None:
                 if any(not blank(c.value) and c.data_type != "f" for c in sheet[row]):
                     raise ImportProblem(f"Строка {row} ниже таблицы содержит данные. Добавление поверх неё остановлено.")
-                append_row(sheet, cols, row, proto, values, config)
+                for field_name in values:
+                    if field_name not in config["lookups"] and field_name not in ("IFT", "PROM") and sheet.cell(plan.prototype, cols[header(field_name)]).data_type == "f":
+                        raise ImportProblem(f"Образцовая строка {plan.prototype}: входное поле {field_name} содержит формулу.")
+                append_row(sheet, cols, row, plan.prototype, values, config, copy_constants=plan.old_version is not None)
             else:
                 for field, value in values.items():
                     text_write(sheet.cell(row, cols[header(field)]), value)
+            if plan.old_version is not None:
+                text_write(sheet.cell(plan.old_version, cols[environment]), None)
         grow_ranges(sheet, old_end, last, config["matrix_header_row"] + 1)
         book.calculation = CalcProperties(calcId=0, fullCalcOnLoad=True, forceFullCalc=True, calcMode="auto")
         output.parent.mkdir(parents=True, exist_ok=True)

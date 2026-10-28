@@ -50,9 +50,9 @@ def main():
         result = import_files(matrix, [ROOT/'examples/02_template_update.xlsx', ROOT/'examples/03_template_new_group.xlsx'], output,
                               progress=lambda s: print(s, flush=True))
         elapsed = time.monotonic()-start
-        assert (result.added, result.updated, result.skipped) == (3, 1, 1), result
+        assert (result.added, result.updated, result.skipped, result.versioned) == (4, 0, 1, 1), result
         check = load_workbook(output, read_only=True)
-        assert check.worksheets[0].max_row == args.rows + 4
+        assert check.worksheets[0].max_row == args.rows + 5
         check.close()
         print(f'Импорт: {elapsed:.2f} с; +{result.added}, обновлено {result.updated}, без изменений {result.skipped}', flush=True)
 
