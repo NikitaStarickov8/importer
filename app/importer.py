@@ -29,6 +29,22 @@ MANDATORY = {
     "technical": ("Технический запрет", "Технический запрет", "Сервис временно недоступен",
                   "Пожалуйста, попробуйте зайти через 5 минут или позже."),
 }
+SERVICE_CODES = {"normal": "NORMAL", "technical": "TECH_ERROR"}
+
+
+def service_entry(value):
+    """Встроенные статусы не являются записями пользовательского справочника."""
+    key = re.sub(r"[\s\-‑–—]+", "", norm(value))
+    for kind, code in SERVICE_CODES.items():
+        description = MANDATORY[kind][0]
+        if key in (norm(code), re.sub(r"[\s\-‑–—]+", "", norm(description))):
+            return Entry(code, description)
+    return None
+
+
+def service_columns(entry):
+    return {"BO_STEP_CODE_DESCRIPTION": entry.code, "BO_STEP_CODE": None,
+            "STOP_LIST_STATUS_PRIORITY": 0, "STATUS_CODE": entry.description, "INFORMATION_SOURCE": "SL"}
 
 
 def business_rules(config):
@@ -163,6 +179,8 @@ class Catalog:
         self.step_cache = {}
 
     def step_code(self, entry):
+        if business_rules(self.config) and service_entry(entry.code):
+            return norm(service_entry(entry.code).code)
         if entry in self.step_cache:
             return self.step_cache[entry]
         spec = self.config["lookups"]["STOP_LIST_STATUS"]
@@ -255,6 +273,10 @@ class Catalog:
         return next(iter(candidates))
 
     def resolve(self, name, value):
+        if name == "STOP_LIST_STATUS" and business_rules(self.config):
+            service = service_entry(value) or service_entry(self.aliases.get(name, {}).get(norm(value)))
+            if service:
+                return service
         cache_key = (name, norm(value))
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -276,11 +298,19 @@ class Catalog:
             invalid = self.invalid_aliases[name].get(norm(value), [])
             if invalid:
                 raise ImportProblem(f"aliases.{name}: для исходного значения «{value}» есть неполная запись основной матрицы: {invalid[0]}.")
+        if name == "STOP_LIST_STATUS" and business_rules(self.config):
+            entry = service_entry(entry.code) or service_entry(entry.description) or entry
         self.cache[cache_key] = entry
         return entry
 
     def accepts(self, name, value, entry):
         """Известный код может уточнить неоднозначное описание, но не заменить его."""
+        if name == "STOP_LIST_STATUS" and business_rules(self.config):
+            service = service_entry(value) or service_entry(self.aliases.get(name, {}).get(norm(value)))
+            if service:
+                return service == entry
+            if service_entry(entry.code):
+                return False
         if norm(value) in self.aliases.get(name, {}):
             return self.resolve(name, value) == entry
         if name not in self.indices:
@@ -291,6 +321,10 @@ class Catalog:
 
     def possible_codes(self, name, value):
         """None — неизвестное соответствие; его нельзя исключать при поиске конфликтов."""
+        if name == "STOP_LIST_STATUS" and business_rules(self.config):
+            service = service_entry(value) or service_entry(self.aliases.get(name, {}).get(norm(value)))
+            if service:
+                return {norm(service.code)}
         try:
             if norm(value) in self.aliases.get(name, {}):
                 return {norm(self.resolve(name, value).code)}
@@ -361,18 +395,22 @@ def canonical(raw, catalog, config, source, require_payload=True):
             values[name] = None
             values[description] = None
             continue
-        entry = catalog.resolve(name, value)
+        service = (service_entry(code_value) or service_entry(desc_value)) if name == "STOP_LIST_STATUS" and business_rules(config) else None
+        entry = service or catalog.resolve(name, value)
+        service = service_entry(entry.code) if name == "STOP_LIST_STATUS" and business_rules(config) else None
         # Английские коды операции/подсистемы — источник истины; русские
         # наименования из шаблона не отменяют известный технический код.
-        if name not in CODE_PRIMARY and not blank(code_value) and not blank(desc_value):
+        if not service and name not in CODE_PRIMARY and not blank(code_value) and not blank(desc_value):
             if not catalog.accepts(name, desc_value, entry):
                 raise ImportProblem(f"{name}: код «{code_value}» не соответствует описанию «{desc_value}».")
-        if require_payload and name not in (*CODE_PRIMARY, "VALUE") and len(catalog.indices[name].get(norm(entry.description), set())) > 1:
+        if not service and require_payload and name not in (*CODE_PRIMARY, "VALUE") and len(catalog.indices[name].get(norm(entry.description), set())) > 1:
             # При записи описания сохранённая Excel-формула могла бы выбрать
             # другой код. Явный входной код не делает такую запись безопасной.
             raise AmbiguousLookup(f"{name}: описание «{entry.description}» соответствует нескольким записям справочника основной матрицы; формульный код нельзя гарантировать.")
         values[name] = entry.code
         values[description] = entry.description
+        if service:
+            literal_codes.extend((name, description, *service_columns(service)))
         if name in CODE_PRIMARY:
             reverse_codes = {norm(item.code) for item in catalog.indices[name].get(norm(entry.description), set())}
             if reverse_codes != {norm(entry.code)} or catalog.invalid_aliases[name].get(norm(entry.description)):
@@ -712,6 +750,9 @@ def payload(record, cols, config):
     for field in ("VALUE", "MAX_AMOUNT", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT"):
         if field in record.values:
             result[field] = record.values[field]
+    service = service_entry(record.values.get("STOP_LIST_STATUS")) if business_rules(config) else None
+    if service:
+        result.update({name: value for name, value in service_columns(service).items() if header(name) in cols})
     return result
 
 
@@ -1233,7 +1274,7 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                     raise ImportProblem(f"Строка {row} ниже таблицы содержит данные. Добавление поверх неё остановлено.")
                 for field_name in values:
                     primary_descriptions = {config["lookups"][name]["description_field"] for name in CODE_PRIMARY}
-                    if field_name not in config["lookups"] and field_name not in {"IFT", "PROM", *primary_descriptions} and sheet.cell(plan.prototype, cols[header(field_name)]).data_type == "f":
+                    if field_name not in config["lookups"] and field_name not in {"IFT", "PROM", *primary_descriptions, *plan.literal_codes} and sheet.cell(plan.prototype, cols[header(field_name)]).data_type == "f":
                         raise ImportProblem(f"Образцовая строка {plan.prototype}: входное поле {field_name} содержит формулу.")
                 append_row(sheet, cols, row, plan.prototype, values, config, copy_constants=plan.old_version is not None, literal_codes=plan.literal_codes)
                 action = "version_added" if plan.old_version is not None else "added"

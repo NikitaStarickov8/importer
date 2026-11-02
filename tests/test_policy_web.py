@@ -16,6 +16,34 @@ class PolicyWebTests(unittest.TestCase):
         web.WebTests.setUp(self)
         self.policy_patch.stop()
 
+    def test_service_rows_without_reference_entries_work_over_http(self):
+        book = load_workbook(self.matrix)
+        try:
+            for name in ('Статусы Стоп Листа','COMPLIANCE_STOP_LIST_CODES'):
+                book[name].delete_rows(2, 2)
+            data = io.BytesIO()
+            book.save(data)
+        finally:
+            book.close()
+        ident = self.create(matrix=data.getvalue(), templates=[self.templates[1].read_bytes()])
+        self.json_request('POST', f'/api/jobs/{ident}/start', {})
+        result = self.wait(ident)
+        self.assertEqual(result['state'], 'done', result)
+        self.assertEqual((result['counts']['added'],result['counts']['conflicted']), (2,0))
+        code, saved, _ = self.request('GET', result['download_url'])
+        self.assertEqual(code, 200)
+        book = load_workbook(io.BytesIO(saved))
+        try:
+            sheet = book.worksheets[0]
+            self.assertEqual(sheet['AA6'].value, 'TECH_ERROR')
+            self.assertEqual(sheet['K6'].value, 'TECH_ERROR')
+            self.assertEqual(sheet['AA7'].value, 'NORMAL')
+            self.assertEqual(sheet['K7'].value, 'NORMAL')
+            self.assertEqual(sheet['AB6'].value, 0)
+            self.assertEqual(sheet['AB7'].value, 0)
+        finally:
+            book.close()
+
     def test_default_policy_upload_download_repeat_and_prom(self):
         ident = self.create()
         self.json_request('POST', f'/api/jobs/{ident}/start', {})

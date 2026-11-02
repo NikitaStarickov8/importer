@@ -45,7 +45,11 @@ class PrimaryCodeTests(unittest.TestCase):
                     self.assertEqual(sheet[f'{target}{row}'].value, code)
                     self.assertEqual(sheet[f'{target}{row}'].data_type, 's')
                 self.assertEqual(sheet[f'A{row}'].data_type, 'f')
-                self.assertEqual(sheet[f'AA{row}'].data_type, 'f')
+                if record.values['STOP_LIST_STATUS'] in ('NORMAL', 'TECH_ERROR'):
+                    self.assertEqual(sheet[f'AA{row}'].value, record.values['STOP_LIST_STATUS'])
+                    self.assertEqual(sheet[f'AA{row}'].data_type, 's')
+                else:
+                    self.assertEqual(sheet[f'AA{row}'].data_type, 'f')
         finally:
             book.close()
         repeat = self.run_import(template, matrix=output, output=self.folder/f'{name}_repeat.xlsx')
