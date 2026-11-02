@@ -61,15 +61,17 @@ async function watch(id) {
       $("status-message").textContent += job.environment === "PROM"
         ? ` Среда: ПРОМ. Включено готовых ИФТ-строк: ${job.counts.promoted}; у прежних ПРОМ-версий снята отметка: ${job.counts.prom_deactivated}. Новые строки и изменения содержимого в ПРОМ-задаче не создаются. Байпас сохранён.`
         : ` Среда: ИФТ. Из добавленных строк новых версий: ${job.counts.versioned}; у старых снята только отметка ИФТ. Байпас проверьте вручную.`;
-      for (const field of ["added", "updated", "skipped", "conflicted"]) $(field).textContent = job.counts[field];
+      $("added").textContent = job.counts.added;
+      $("updated").textContent = (job.changes || []).filter(change => !["added", "version_added"].includes(change.action)).length;
+      $("skipped").textContent = job.counts.skipped + job.counts.conflicted;
+      $("conflicted").textContent = job.counts.conflicted;
       if (conflicts.length) {
         $("status-badge").textContent = "Есть пропуски";
         $("conflicts").textContent = conflicts.join("\n\n");
-        $("conflicts-panel").hidden = false;
       }
       const affected = job.affected_rows || [];
-      $("changes-summary").textContent = `Отчёт по строкам шаблонов (${(job.outcomes || []).length})`;
-      $("affected-rows").textContent = affected.length ? `Изменены строки Excel (${affected.length}): ${affected.join(", ")}` : "Изменённых строк нет. Причины пропусков и совпадений указаны ниже.";
+      $("changes-summary").textContent = "Отчёт: пропущено, добавлено, изменено";
+      $("affected-rows").textContent = "";
       $("row-changes").textContent = job.change_report || "";
       $("changes-panel").hidden = false;
       $("counts").hidden = false; $("download-row").hidden = false;

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "vendor"), str(ROOT)]
@@ -19,6 +20,11 @@ warnings.filterwarnings("ignore", message="Title is more than 31 characters")
 
 class ImportTests(unittest.TestCase):
     def setUp(self):
+        # Регрессии прежнего ядра (формулы, ссылки, версии, безопасность).
+        # Новые бизнес-правила проверяются отдельно без отключения политики.
+        policy = patch('app.importer.business_rules', return_value=False)
+        policy.start()
+        self.addCleanup(policy.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.folder = Path(self.tmp.name)
         # Прежние проверки преобразований используют строку только на ИФТ.
@@ -295,13 +301,19 @@ class ImportTests(unittest.TestCase):
         self.assertEqual((result.added, result.updated, result.skipped), (0, 0, 4))
         self.assertEqual(len(result.conflicts), 1)
 
-    def test_known_template_code_cannot_produce_ambiguous_formula_result(self):
+    def test_known_code_is_literal_and_uncertain_existing_rows_remain_manual(self):
         matrix = self.change(self.matrix, lambda b: b['Подсистемы'].append(['OTHER_LOAN', 'Демонстрационная подсистема']), 'ambiguous_loan.xlsx')
         result = self.run_import(matrix=matrix)
-        # В шаблонах задан DEMO_LOAN, но описание для INDEX/MATCH не уникально.
-        self.assertEqual((result.added, result.updated, result.skipped), (0, 0, 0))
-        self.assertEqual(len(result.conflicts), 5)
-        self.assertTrue(all('формульный код' in message for message in result.conflicts))
+        # Новые записи сохраняют английский код. У старых формульных строк
+        # нельзя угадать код по одному общему описанию: они остаются ручными.
+        self.assertEqual((result.added, result.updated, result.skipped), (3, 0, 0))
+        self.assertEqual(len(result.conflicts), 2)
+        self.assertTrue(all('неразобранными строками' in message for message in result.conflicts))
+        book = load_workbook(self.output)
+        try:
+            self.assertTrue(all(book.worksheets[0][f'H{row}'].value == 'DEMO_LOAN' for row in (6, 7, 8)))
+        finally:
+            book.close()
 
     def test_unclear_formula_key_is_not_treated_as_empty(self):
         def edit(book):

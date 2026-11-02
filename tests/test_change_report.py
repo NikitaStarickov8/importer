@@ -21,14 +21,15 @@ class ChangeReportTests(unittest.TestCase):
         self.assertEqual(result.affected_rows, [2, 6, 7, 8])
         self.assertEqual([(c.excel_row, c.action) for c in result.changes], [(2, 'updated'), (6, 'added'), (7, 'added'), (8, 'added')])
         self.assertEqual(result.changes[0].changed_fields, ['TEXT_FOR_CLIENT'])
-        self.assertIn('Затронуты строки Excel: 2, 6, 7, 8', result.change_report)
+        self.assertIn('ДОБАВЛЕНО (3)', result.change_report)
+        self.assertIn('ИЗМЕНЕНО (1)', result.change_report)
         self.assertEqual(len(result.outcomes), result.total)
         unchanged = [outcome for outcome in result.outcomes if outcome.status == 'unchanged']
         self.assertEqual(len(unchanged), 1)
         self.assertEqual(unchanged[0].excel_rows, [3])
         self.assertIn('!19', unchanged[0].source)
         self.assertIn('совпадают', unchanged[0].reason)
-        self.assertIn('БЕЗ ИЗМЕНЕНИЙ', result.change_report)
+        self.assertIn('ПРОПУЩЕНО (1)', result.change_report)
         before, after = load_workbook(self.matrix), load_workbook(self.output)
         try:
             a, b = before.worksheets[0], after.worksheets[0]
@@ -43,8 +44,8 @@ class ChangeReportTests(unittest.TestCase):
         self.assertEqual(result.affected_rows, [2, 6])
         self.assertEqual([(c.excel_row, c.action, c.related_row) for c in result.changes], [(2, 'ift_deactivated', 6), (6, 'version_added', 2)])
         self.assertEqual(result.changes[0].changed_fields, ['IFT'])
-        self.assertIn('прежняя строка: 2', result.change_report)
-        self.assertIn('новая версия: 6', result.change_report)
+        self.assertIn('связанная строка Excel: 2', result.change_report)
+        self.assertIn('связанная строка Excel: 6', result.change_report)
 
     def test_prom_report_lists_both_flag_changes(self):
         result = self.run_import(matrix=self.prepared_ift(old_prom=True, old_ift=1), templates=[self.single_template()], environment='PROM')
@@ -65,7 +66,7 @@ class ChangeReportTests(unittest.TestCase):
         result = self.run_import(matrix=self.output, output=self.folder / 'repeat.xlsx')
         self.assertEqual(result.affected_rows, [])
         self.assertEqual(result.changes, [])
-        self.assertIn('Изменённых строк нет.', result.change_report)
+        self.assertIn('ИЗМЕНЕНО (0)', result.change_report)
         self.assertEqual(len(result.outcomes), 5)
         self.assertTrue(all(outcome.status == 'unchanged' for outcome in result.outcomes))
 
@@ -84,7 +85,7 @@ class ChangeReportTests(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertEqual(conflicts[0].excel_rows, [2, 6])
         self.assertIn('несколько подходящих', conflicts[0].reason)
-        self.assertIn('ПРОПУЩЕНА: РУЧНОЙ РАЗБОР', result.change_report)
+        self.assertIn('Ручной разбор.', result.change_report)
 
     def test_duplicate_templates_do_not_duplicate_report_entries(self):
         template = self.single_template()
@@ -94,7 +95,7 @@ class ChangeReportTests(unittest.TestCase):
         self.assertEqual([outcome.status for outcome in result.outcomes], ['updated', 'skipped'])
         self.assertEqual(result.outcomes[1].excel_rows, [2])
         self.assertIn('Первый источник', result.outcomes[1].reason)
-        self.assertIn('ПРОПУЩЕНА: ПОВТОР', result.change_report)
+        self.assertIn('Повтор такой же записи', result.change_report)
 
     def test_formula_first_column_is_not_evaluated_or_used_as_row_number(self):
         result = self.run_import(templates=[self.single_template()])
@@ -103,7 +104,7 @@ class ChangeReportTests(unittest.TestCase):
         self.assertEqual(change.first_column_name, 'CODE')
         self.assertEqual(change.first_column_kind, 'formula')
         self.assertIsNone(change.first_column_value)
-        self.assertIn('значение после пересчёта формулы', result.change_report)
+        self.assertNotIn('значение после пересчёта формулы', result.change_report)
         self.assertNotIn('CODE=2', result.change_report)
 
     def test_literal_first_column_preserves_identifier(self):
@@ -113,7 +114,7 @@ class ChangeReportTests(unittest.TestCase):
         self.assertEqual(change.excel_row, 2)
         self.assertEqual(change.first_column_value, '000123141')
         self.assertEqual(change.first_column_kind, 'value')
-        self.assertIn('CODE=000123141', result.change_report)
+        self.assertNotIn('CODE', result.change_report)
 
     def test_first_column_label_follows_actual_first_column(self):
         def edit(book):

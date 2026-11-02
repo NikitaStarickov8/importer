@@ -20,6 +20,10 @@ from app.importer import import_files
 
 class WebTests(unittest.TestCase):
     def setUp(self):
+        policy = patch('app.importer.business_rules', return_value=False)
+        self.policy_patch = policy
+        policy.start()
+        self.addCleanup(policy.stop)
         self.state = AppState()
         self.server = LocalServer(0, self.state)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': 0.01})
@@ -99,10 +103,10 @@ class WebTests(unittest.TestCase):
         self.assertEqual(job['conflicts'], [])
         self.assertEqual(job['affected_rows'], [2, 6, 7, 8, 9])
         self.assertEqual([(c['excel_row'], c['action']) for c in job['changes']], [(2, 'ift_deactivated'), (6, 'version_added'), (7, 'added'), (8, 'added'), (9, 'added')])
-        self.assertIn('Затронуты строки Excel: 2, 6, 7, 8, 9', job['change_report'])
+        self.assertIn('ДОБАВЛЕНО (4)', job['change_report'])
         self.assertEqual(len(job['outcomes']), 5)
         self.assertTrue(all('001_' not in outcome['source'] and '002_' not in outcome['source'] for outcome in job['outcomes']))
-        self.assertIn('БЕЗ ИЗМЕНЕНИЙ', job['change_report'])
+        self.assertIn('ПРОПУЩЕНО (1)', job['change_report'])
         code, payload, headers = self.request('GET',job['download_url'])
         self.assertEqual(code,200)
         self.assertIn('attachment',headers['Content-Disposition'])

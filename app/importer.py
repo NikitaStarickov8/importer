@@ -21,6 +21,18 @@ from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
 ROOT = Path(__file__).resolve().parent.parent
 MUTABLE_FIELDS = ("VALUE", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT")
 DEFAULT_TRANSACTION_DESCRIPTION = "Не финансовые операции"
+CODE_PRIMARY = ("OPERATION_TYPE", "SP_NAME")
+POLICY_GROUP = ["CHANNEL_INDICATOR", "SP_NAME", "OPERATION_TYPE", "RELATION_TYPE",
+                "CLIENT_TYPE", "INSPECTED_PERSON", "MATCH_NEGATIVE_CASE"]
+MANDATORY = {
+    "normal": ("В стоп-листе не найден", "Разрешено", None, None),
+    "technical": ("Технический запрет", "Технический запрет", "Сервис временно недоступен",
+                  "Пожалуйста, попробуйте зайти через 5 минут или позже."),
+}
+
+
+def business_rules(config):
+    return config.get("business_rules", True)
 
 
 class ImportProblem(Exception):
@@ -87,6 +99,10 @@ def configured_aliases(config):
 def load_config(path=None):
     with open(path or ROOT / "config.json", encoding="utf-8") as stream:
         config = json.load(stream)
+    # Старые пользовательские config.json продолжают работать без замены aliases.
+    if business_rules(config):
+        config["group_key"] = POLICY_GROUP.copy()
+        config["row_key"] = ["STOP_LIST_STATUS"]
     keys = config["group_key"] + config["row_key"]
     if len(keys) != len(set(keys)):
         raise ImportProblem("В настройке ключа повторяется одно из полей.")
@@ -138,11 +154,35 @@ class Catalog:
         self.book = book
         self.config = config
         self.indices = {}
+        self.code_entries = {}
         self.invalid_aliases = {}
         self.issues = {}
         self.catalog_locations = {}
         self.aliases = configured_aliases(config)
         self.cache = {}
+        self.step_cache = {}
+
+    def step_code(self, entry):
+        if entry in self.step_cache:
+            return self.step_cache[entry]
+        spec = self.config["lookups"]["STOP_LIST_STATUS"]
+        sheet = sheet_named(self.book, spec["sheet"])
+        candidates = set()
+        for row in range(2, sheet.max_row + 1):
+            try:
+                code = template_value(sheet.cell(row, spec["code_col"]))
+            except ImportProblem:
+                continue
+            if norm(code) == norm(entry.code):
+                value = template_value(sheet.cell(row, spec.get("step_code_col", 3)))
+                if blank(value):
+                    raise ImportProblem(f"Справочник «{sheet.title}», строка {row}: не заполнен стопкод (BO_STEP_CODE_DESCRIPTION).")
+                candidates.add(norm(value))
+        if len(candidates) != 1:
+            raise AmbiguousLookup(f"Статус «{entry.description}»: нельзя однозначно определить стопкод BO_STEP_CODE_DESCRIPTION.")
+        result = next(iter(candidates))
+        self.step_cache[entry] = result
+        return result
 
     def _build_index(self, name):
         spec = self.config["lookups"][name]
@@ -151,6 +191,7 @@ class Catalog:
         except ImportProblem as exc:
             raise ImportProblem(f"Основная матрица, справочник «{spec['sheet']}»: {exc}") from exc
         index, invalid = defaultdict(set), defaultdict(list)
+        codes = defaultdict(list)
         issues = []
         for row in sheet.iter_rows(min_row=2, max_col=max(spec["code_col"], spec["description_col"])):
             code_cell, desc_cell = row[spec["code_col"] - 1], row[spec["description_col"] - 1]
@@ -177,9 +218,11 @@ class Catalog:
                     invalid[alias].append(issue)
                 continue
             entry = Entry(code, desc)
+            codes[norm(code)].append(entry)
             index[norm(code)].add(entry)
             index[norm(desc)].add(entry)
         self.indices[name] = index
+        self.code_entries[name] = codes
         self.invalid_aliases[name] = invalid
         self.issues[name] = issues
         self.catalog_locations[name] = (sheet.title, get_column_letter(spec["code_col"]), get_column_letter(spec["description_col"]))
@@ -193,6 +236,14 @@ class Catalog:
             details = "; ".join(invalid[:3])
             raise ImportProblem(f"{name}: для значения «{value}» в основной матрице, справочник «{title}», есть неполная или непрочитанная запись: {details}.")
         candidates = self.indices[name].get(norm(value), set())
+        if name in CODE_PRIMARY:
+            # Сохраняем порядок строк справочника, не порядок обхода set.
+            direct = self.code_entries[name].get(norm(value))
+            if direct:
+                return direct[0]
+            unique_codes = {norm(entry.code) for entry in candidates}
+            if len(unique_codes) == 1:
+                return self.code_entries[name][next(iter(unique_codes))][0]
         if len(candidates) != 1:
             reason = "не найдено" if not candidates else "соответствует нескольким записям"
             details = ""
@@ -219,7 +270,8 @@ class Catalog:
                 raise ImportProblem(f"aliases.{name}: «{target}» — описание, а требуется технический код из основной матрицы.")
             # Существующий однозначный код/описание нельзя незаметно переназначить.
             original = self.indices[name].get(norm(value), set())
-            if original and original != {entry}:
+            same_code = name in CODE_PRIMARY and all(norm(item.code) == norm(entry.code) for item in original)
+            if original and original != {entry} and not same_code:
                 raise ImportProblem(f"aliases.{name}: соответствие «{value}» → «{target}» конфликтует с записью основной матрицы.")
             invalid = self.invalid_aliases[name].get(norm(value), [])
             if invalid:
@@ -246,6 +298,8 @@ class Catalog:
                 self._build_index(name)
             if self.invalid_aliases[name].get(norm(value)):
                 return None
+            if name in CODE_PRIMARY and norm(value) in self.code_entries[name]:
+                return {norm(value)}
             entries = self.indices[name].get(norm(value), set())
             return {norm(entry.code) for entry in entries} or None
         except ImportProblem:
@@ -270,8 +324,16 @@ def amount(value):
 class Record:
     values: dict
     source: str
+    synthetic: bool = False
+
+    def group_key(self, config):
+        parts = [norm(self.values.get(name)) for name in config["group_key"]]
+        platform = self.values.get("SBOL_PRO_PLATFORM") if norm(self.values.get("CHANNEL_INDICATOR")) == norm(config["platform_channel"]) else None
+        return tuple(parts + [norm(platform)])
 
     def key(self, config):
+        if business_rules(config):
+            return self.group_key(config) + (norm(self.values.get("_BO_STEP_CODE")),)
         fields = config["group_key"] + config["row_key"]
         parts = [norm(self.values.get(field)) for field in fields]
         platform = self.values.get("SBOL_PRO_PLATFORM") if norm(self.values.get("CHANNEL_INDICATOR")) == norm(config["platform_channel"]) else None
@@ -280,6 +342,7 @@ class Record:
 
 def canonical(raw, catalog, config, source, require_payload=True):
     values = dict(raw)
+    literal_codes = []
     required = set(config["group_key"] + ["STOP_LIST_STATUS", "MATCH_NEGATIVE_CASE", "INSPECTED_PERSON"])
     if require_payload:
         required.add("VALUE")
@@ -299,18 +362,28 @@ def canonical(raw, catalog, config, source, require_payload=True):
             values[description] = None
             continue
         entry = catalog.resolve(name, value)
-        if not blank(code_value) and not blank(desc_value):
+        # Английские коды операции/подсистемы — источник истины; русские
+        # наименования из шаблона не отменяют известный технический код.
+        if name not in CODE_PRIMARY and not blank(code_value) and not blank(desc_value):
             if not catalog.accepts(name, desc_value, entry):
                 raise ImportProblem(f"{name}: код «{code_value}» не соответствует описанию «{desc_value}».")
-        if require_payload and name != "VALUE" and len(catalog.indices[name].get(norm(entry.description), set())) > 1:
+        if require_payload and name not in (*CODE_PRIMARY, "VALUE") and len(catalog.indices[name].get(norm(entry.description), set())) > 1:
             # При записи описания сохранённая Excel-формула могла бы выбрать
             # другой код. Явный входной код не делает такую запись безопасной.
             raise AmbiguousLookup(f"{name}: описание «{entry.description}» соответствует нескольким записям справочника основной матрицы; формульный код нельзя гарантировать.")
         values[name] = entry.code
         values[description] = entry.description
+        if name in CODE_PRIMARY:
+            reverse_codes = {norm(item.code) for item in catalog.indices[name].get(norm(entry.description), set())}
+            if reverse_codes != {norm(entry.code)} or catalog.invalid_aliases[name].get(norm(entry.description)):
+                literal_codes.append(name)
+    values["_LITERAL_CODES"] = tuple(literal_codes)
     if norm(values.get("CHANNEL_INDICATOR")) == norm(config["platform_channel"]) and blank(values.get("SBOL_PRO_PLATFORM")):
         raise ImportProblem("Для канала SBOL_PRO требуется SBOL_PRO_PLATFORM.")
     values["MAX_AMOUNT"] = amount(raw.get("MAX_AMOUNT"))
+    if business_rules(config):
+        entry = catalog.resolve("STOP_LIST_STATUS", values["STOP_LIST_STATUS"])
+        values["_BO_STEP_CODE"] = catalog.step_code(entry)
     return Record(values, source)
 
 
@@ -360,7 +433,65 @@ def template_value(cell, visited=None):
     return template_value(target, visited | {location})
 
 
-def parse_template(path, catalog, config, conflicts=None, outcomes=None):
+def template_code_primary(sheet, cols, row, catalog, config, name):
+    """Код строки, код в прежнем столбце описания, код шапки, затем русский текст.
+
+    Русскую ячейку с #N/A/INDEX/MATCH не читаем, если уже дан английский код.
+    Непрочитанную формулу кода можно заменить явно введённым кодом шапки;
+    неизвестный буквальный код никогда не заменяем другим кодом.
+    """
+    description = config["lookups"][name]["description_field"]
+    errors = []
+
+    def read(cell):
+        try:
+            return template_value(cell)
+        except ImportProblem as exc:
+            errors.append(exc)
+            return None
+
+    if header(name) in cols:
+        value = read(sheet.cell(row, cols[header(name)]))
+        if not blank(value):
+            return {name: value}
+
+    row_description = None
+    description_error = None
+    if header(description) in cols:
+        error_count = len(errors)
+        row_description = read(sheet.cell(row, cols[header(description)]))
+        if len(errors) > error_count:
+            description_error = errors[-1]
+        if not blank(row_description):
+            try:
+                entry = catalog.resolve(name, row_description)
+            except ImportProblem:
+                entry = None
+            # Старые шаблоны передают технические коды в столбцах описания.
+            if entry is not None and norm(entry.code) == norm(row_description):
+                return {name: row_description}
+            if isinstance(row_description, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]*", row_description.strip()):
+                return {name: row_description}
+
+    for address in TOP_CELLS[name]:
+        value = read(sheet[address])
+        if not blank(value):
+            return {name: value}
+
+    if not blank(row_description):
+        return {description: row_description}
+    if description_error is not None:
+        raise description_error
+    for address in TOP_CELLS.get(description, ()):
+        value = read(sheet[address])
+        if not blank(value):
+            return {description: value}
+    if errors:
+        raise errors[0]
+    return {}
+
+
+def parse_template(path, catalog, config, conflicts=None, outcomes=None, group_seeds=None):
     book = load_workbook(path, read_only=False, data_only=False)
     try:
         matches = [s for s in book if norm(config["template_sheet_contains"]) in norm(s.title)]
@@ -397,7 +528,7 @@ def parse_template(path, catalog, config, conflicts=None, outcomes=None):
 
         def fill_common(raw):
             for name, spec in config["lookups"].items():
-                if name == "VALUE":
+                if name in ("VALUE", *CODE_PRIMARY):
                     continue
                 description = spec["description_field"]
                 # Заполненные значения строки приоритетнее всей шапки.
@@ -416,6 +547,15 @@ def parse_template(path, catalog, config, conflicts=None, outcomes=None):
         known.update({header(v["description_field"]): v["description_field"] for k, v in config["lookups"].items() if k != "VALUE"})
         for field in ("VALUE", "MAX_AMOUNT", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT"):
             known[header(field)] = field
+        primary_fields = set(CODE_PRIMARY) | {config["lookups"][name]["description_field"] for name in CODE_PRIMARY}
+
+        def read_raw(row, fields=None):
+            raw = {field: template_value(sheet.cell(row, cols[key])) for key, field in known.items()
+                   if key in cols and field not in primary_fields and (fields is None or field in fields)}
+            for name in CODE_PRIMARY:
+                raw.update(template_code_primary(sheet, cols, row, catalog, config, name))
+            return raw
+
         for row in range(max(header_row + 1, config["template_data_start_row"]), sheet.max_row + 1):
             value_col = cols["VALUE"]
             signals = [sheet.cell(row, cols[x]).value for x in marker_fields]
@@ -424,12 +564,41 @@ def parse_template(path, catalog, config, conflicts=None, outcomes=None):
             row_count += 1
             source = f"{Path(path).name}, {sheet.title}!{row}"
             try:
-                raw = {field: template_value(sheet.cell(row, cols[key])) for key, field in known.items() if key in cols}
+                if business_rules(config):
+                    # Устаревшие строки исключаем до чтения остальных полей:
+                    # их суммы, формулы и неизвестные стопкоды не нужны импорту.
+                    match = template_value(sheet.cell(row, cols["MATCH_NEGATIVE_CASE_DESCRIPTION"]))
+                    if norm(match) in (norm("Частичное совпадение"), "partial_match"):
+                        if outcomes is not None:
+                            outcomes.append(RecordOutcome(source, "skipped", [], "Частичное совпадение больше не используется; строка не импортируется."))
+                        continue
+                    resolution = catalog.resolve("VALUE", template_value(sheet.cell(row, value_col)))
+                    status = template_value(sheet.cell(row, cols["STOP_LIST_STATUS_DESCRIPTION"]))
+                    permitted = catalog.resolve("VALUE", "Разрешено")
+                    normal = catalog.resolve("STOP_LIST_STATUS", MANDATORY["normal"][0])
+                    if resolution == permitted and not catalog.accepts("STOP_LIST_STATUS", status, normal):
+                        # Группа всё равно нуждается в обязательных строках.
+                        group_fields = set(config["group_key"] + ["SBOL_PRO_PLATFORM", "TRANSACTION_TYPE"])
+                        group_fields |= {config["lookups"][f]["description_field"] for f in group_fields}
+                        raw = read_raw(row, group_fields)
+                        fill_common(raw)
+                        raw.update(STOP_LIST_STATUS=normal.code, STOP_LIST_STATUS_DESCRIPTION=normal.description,
+                                   VALUE=permitted.code, MAX_AMOUNT=None, TITLE_FOR_CLIENT=None, TEXT_FOR_CLIENT=None)
+                        seed = canonical(raw, catalog, config, source)
+                        if group_seeds is not None:
+                            group_seeds.append(seed)
+                        if outcomes is not None:
+                            outcomes.append(RecordOutcome(source, "skipped", [], "Разрешено: отсутствие записи означает разрешение; обычная разрешающая строка не добавляется.", record_summary(seed, status)))
+                        continue
+                raw = read_raw(row)
                 fill_common(raw)
                 raw["VALUE"] = template_value(sheet.cell(row, value_col))
                 raw["TITLE_FOR_CLIENT"] = raw.get("TITLE_FOR_CLIENT")
                 raw["TEXT_FOR_CLIENT"] = raw.get("TEXT_FOR_CLIENT")
-                result.append(canonical(raw, catalog, config, source))
+                record = canonical(raw, catalog, config, source)
+                result.append(record)
+                if group_seeds is not None:
+                    group_seeds.append(record)
             except AmbiguousLookup as exc:
                 if conflicts is None:
                     raise
@@ -448,10 +617,12 @@ def parse_template(path, catalog, config, conflicts=None, outcomes=None):
 
 def read_matrix_row(sheet, cols, row, catalog, config):
     raw = {}
-    for field in config["group_key"] + config["row_key"] + ["SBOL_PRO_PLATFORM"]:
+    for field in dict.fromkeys(config["group_key"] + config["row_key"] + ["SBOL_PRO_PLATFORM", "TRANSACTION_TYPE", "MAX_AMOUNT"]):
         if field in config["lookups"]:
             desc = config["lookups"][field]["description_field"]
             for f in (field, desc):
+                if field in CODE_PRIMARY and f == desc and not blank(raw.get(field)):
+                    continue
                 if header(f) in cols:
                     cell = sheet.cell(row, cols[header(f)])
                     if cell.data_type != "f":
@@ -509,6 +680,13 @@ def uncertain_constraints(sheet, cols, row, catalog, config):
             except ImportProblem:
                 choices = None
         constraints[name] = choices
+    if business_rules(config):
+        choices = constraints.pop("STOP_LIST_STATUS", None)
+        try:
+            constraints["_BO_STEP_CODE"] = None if choices is None else {
+                catalog.step_code(catalog.resolve("STOP_LIST_STATUS", code)) for code in choices}
+        except ImportProblem:
+            constraints["_BO_STEP_CODE"] = None
     return constraints
 
 
@@ -570,7 +748,7 @@ def grow_ranges(sheet, old_end, new_end, start):
                 sheet.conditional_formatting.add(new, rule)
 
 
-def append_row(sheet, cols, row, proto, values, config, copy_constants=False):
+def append_row(sheet, cols, row, proto, values, config, copy_constants=False, literal_codes=()):
     for col in range(1, sheet.max_column + 1):
         src, dst = sheet.cell(proto, col), sheet.cell(row, col)
         dst._style = copy(src._style)
@@ -595,7 +773,10 @@ def append_row(sheet, cols, row, proto, values, config, copy_constants=False):
         sheet.cell(row, cols["CODE"], row - config["matrix_header_row"])
     for field, value in values.items():
         cell = sheet.cell(row, cols[header(field)])
-        if cell.data_type != "f" or field in ("IFT", "PROM"):
+        # При неоднозначном обратном поиске закрепляем английский код;
+        # русские названия новых записей задаём из выбранной строки справочника.
+        primary_description = any(field == config["lookups"][name]["description_field"] for name in CODE_PRIMARY)
+        if cell.data_type != "f" or field in ("IFT", "PROM") or field in literal_codes or primary_description:
             text_write(cell, value)
     # Байпас никогда не переносится из шаблона или старой версии.
     bypass = header(config.get("bypass_target", "VALUE_SWITCH"))
@@ -643,6 +824,7 @@ class Plan:
     values: dict
     prototype: int | None = None
     old_version: int | None = None
+    literal_codes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -662,10 +844,23 @@ class RecordOutcome:
     status: str
     excel_rows: list[int]
     reason: str
+    description: str = ""
+
+
+def record_summary(record, status=None):
+    fields = [("Подсистема", "SP_NAME"), ("Операция", "OPERATION_TYPE"),
+              ("Канал", "CHANNEL_INDICATOR"), ("Платформа", "SBOL_PRO_PLATFORM_DESCRIPTION"),
+              ("Участник", "RELATION_TYPE_DESCRIPTION"), ("Тип клиента", "CLIENT_TYPE_DESCRIPTION"),
+              ("Проверяемое лицо", "INSPECTED_PERSON_DESCRIPTION"), ("Совпадение", "MATCH_NEGATIVE_CASE_DESCRIPTION")]
+    values = [f"{label}: {record.values[name]}" for label, name in fields if not blank(record.values.get(name))]
+    values.append("Статус: " + str(status if status is not None else record.values.get("STOP_LIST_STATUS_DESCRIPTION", "")))
+    if not blank(record.values.get("DESCRIPTION")):
+        values.append("Резолюция: " + str(record.values["DESCRIPTION"]))
+    return "; ".join(values)
 
 
 def add_outcome(result, source, status, rows, reason):
-    outcome = RecordOutcome(source, status, sorted(set(rows)), reason)
+    outcome = RecordOutcome(source, status, sorted(set(rows)), reason, result.descriptions.get(source, ""))
     result.outcomes.append(outcome)
     return outcome
 
@@ -685,38 +880,49 @@ def row_change(sheet, row, action, fields, related_row, header_row):
 
 def format_change_report(result):
     lines = [f"Среда: {'ИФТ' if result.environment == 'IFT' else 'ПРОМ'}.",
-             "Ниже указаны номера строк Excel в сохранённом результате, а не значения CODE.",
-             "Формулы первого столбца здесь не пересчитываются.", ""]
-    if not result.changes:
-        lines.append("Изменённых строк нет.")
-    else:
-        lines += ["Затронуты строки Excel: " + ", ".join(map(str, result.affected_rows)), ""]
-    labels = {"added": "добавлена запись", "updated": "изменена запись",
-              "version_added": "добавлена ИФТ-версия", "ift_deactivated": "снята отметка IFT",
-              "prom_activated": "поставлена отметка PROM", "prom_deactivated": "снята отметка PROM"}
-    links = {"version_added": "прежняя строка", "ift_deactivated": "новая версия",
-             "prom_activated": "прежняя ПРОМ-строка", "prom_deactivated": "включена строка"}
-    for change in result.changes:
-        line = f"Строка {change.excel_row}: {labels[change.action]}"
-        if change.action == "updated" and change.changed_fields:
-            line += "; поля: " + ", ".join(change.changed_fields)
-        if change.related_row is not None:
-            line += f"; {links[change.action]}: {change.related_row}"
-        if change.first_column_kind == "value":
-            line += f"; {change.first_column_name}={change.first_column_value}"
-        elif change.first_column_kind == "formula":
-            line += f"; {change.first_column_name}: значение после пересчёта формулы"
-        elif change.first_column_kind == "error":
-            line += f"; {change.first_column_name}: ошибка {change.first_column_value}"
-        lines.append(line)
-    if result.outcomes:
-        lines += ["", "Результат по строкам шаблонов:"]
-        statuses = {"added": "ДОБАВЛЕНА", "versioned": "НОВАЯ ИФТ-ВЕРСИЯ", "updated": "ИЗМЕНЕНА",
-                    "promoted": "ВКЛЮЧЕНА В ПРОМ", "unchanged": "БЕЗ ИЗМЕНЕНИЙ",
-                    "skipped": "ПРОПУЩЕНА: ПОВТОР", "conflict": "ПРОПУЩЕНА: РУЧНОЙ РАЗБОР"}
-        for outcome in result.outcomes:
-            rows = ", ".join(map(str, outcome.excel_rows)) or "не определены"
-            lines.append(f"{outcome.source} — {statuses[outcome.status]}; строки матрицы: {rows}. {outcome.reason}")
+             "Все номера ниже — номера строк Excel в итоговой матрице."]
+    def readable(text):
+        for name, label in (("TITLE_FOR_CLIENT", "экранный заголовок"), ("TEXT_FOR_CLIENT", "текст сообщения"),
+                            ("TRANSACTION_TYPE", "тип транзакции"), ("MAX_AMOUNT", "сумма"), ("VALUE", "резолюция")):
+            text = text.replace(name, label)
+        return text
+    def details(outcome):
+        items = []
+        if outcome.description:
+            items.append("   " + outcome.description)
+        items.append("   Источник: " + outcome.source)
+        return items
+    changed_outcomes = {}
+    for outcome in result.outcomes:
+        if outcome.status in ("added", "versioned", "updated", "promoted"):
+            for row in outcome.excel_rows:
+                changed_outcomes.setdefault(row, outcome)
+    skipped = [o for o in result.outcomes if o.status in ("skipped", "unchanged", "conflict")]
+    lines += ["", f"ПРОПУЩЕНО ({len(skipped)})"]
+    for i, outcome in enumerate(skipped, 1):
+        rows = " Строки Excel: " + ", ".join(map(str, outcome.excel_rows)) + "." if outcome.excel_rows else ""
+        manual = "Ручной разбор. " if outcome.status == "conflict" else ""
+        lines.append(f"{i}. {manual}{readable(outcome.reason)}{rows}")
+        lines.extend(details(outcome))
+    if not skipped:
+        lines.append("Нет.")
+    for title, actions in (("ДОБАВЛЕНО", {"added", "version_added"}),
+                           ("ИЗМЕНЕНО", {"updated", "ift_deactivated", "prom_activated", "prom_deactivated"})):
+        changes = [c for c in result.changes if c.action in actions]
+        lines += ["", f"{title} ({len(changes)})"]
+        for change in changes:
+            outcome = changed_outcomes.get(change.excel_row)
+            action = {"added": "добавлена запись", "version_added": "добавлена новая ИФТ-версия",
+                      "updated": "изменена запись", "ift_deactivated": "снята отметка IFT",
+                      "prom_activated": "поставлена отметка PROM", "prom_deactivated": "снята отметка PROM"}[change.action]
+            if change.related_row is not None:
+                action += f"; связанная строка Excel: {change.related_row}"
+            lines.append(f"Строка Excel {change.excel_row}: {action}.")
+            if outcome:
+                lines.append("   " + readable(outcome.reason))
+                lines.extend(details(outcome))
+        if not changes:
+            lines.append("Нет.")
     return "\n".join(lines)
 
 
@@ -736,6 +942,44 @@ class Result:
     affected_rows: list[int] = field(default_factory=list)
     change_report: str = ""
     outcomes: list[RecordOutcome] = field(default_factory=list)
+    descriptions: dict[str, str] = field(default_factory=dict)
+
+
+def mandatory_kind(record, catalog):
+    for kind, (status, _, _, _) in MANDATORY.items():
+        if norm(record.values["STOP_LIST_STATUS"]) == norm(catalog.resolve("STOP_LIST_STATUS", status).code):
+            return kind
+    return None
+
+
+def add_mandatory_records(incoming, seeds, catalog, config, result):
+    groups = defaultdict(list)
+    for seed in seeds:
+        groups[seed.group_key(config)].append(seed)
+    present = {(r.group_key(config), mandatory_kind(r, catalog)) for r in incoming}
+    for group, records in groups.items():
+        seed = records[0]
+        for kind, (status, resolution, title, text) in MANDATORY.items():
+            if (group, kind) in present:
+                continue
+            source = f"Автоматически: {status} (группа из {seed.source})"
+            result.total += 1
+            result.descriptions[source] = record_summary(seed, status)
+            if len({norm(r.values.get("TRANSACTION_TYPE")) for r in records}) != 1:
+                add_conflict(result, source, "В одной группе шаблонов различается TRANSACTION_TYPE. Обязательная строка не создана; требуется ручной разбор.")
+                continue
+            raw = dict(seed.values)
+            entry = catalog.resolve("STOP_LIST_STATUS", status)
+            raw.update(STOP_LIST_STATUS=entry.code, STOP_LIST_STATUS_DESCRIPTION=entry.description,
+                       VALUE=catalog.resolve("VALUE", resolution).code, MAX_AMOUNT=None,
+                       TITLE_FOR_CLIENT=title, TEXT_FOR_CLIENT=text)
+            record = canonical(raw, catalog, config, source)
+            record.synthetic = True
+            incoming.append(record)
+
+
+def protected_differences(a, b):
+    return [name for name in ("TRANSACTION_TYPE", "MAX_AMOUNT") if norm(a.values.get(name)) != norm(b.values.get(name))]
 
 
 def import_files(matrix, templates, output, config_path=None, progress: Callable[[str], None] = lambda _: None, environment="IFT"):
@@ -771,21 +1015,27 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
         if missing:
             raise ImportProblem("В матрице нет столбцов: " + ", ".join(sorted(missing)))
         catalog = Catalog(book, config)
-        incoming, conflicts, outcomes = [], [], []
+        incoming, conflicts, outcomes, group_seeds = [], [], [], []
         for path in templates:
             progress(f"Читаю шаблон {path.name}…")
             try:
-                incoming.extend(parse_template(path, catalog, config, conflicts, outcomes))
+                incoming.extend(parse_template(path, catalog, config, conflicts, outcomes, group_seeds))
             except ImportProblem as exc:
                 if str(exc).startswith(f"{path.name}, "):
                     raise
                 raise ImportProblem(f"{path.name}: {exc}") from exc
-        result = Result(total=len(incoming) + len(conflicts), output=str(output), conflicts=conflicts, environment=environment, outcomes=outcomes)
+        result = Result(total=len(incoming) + len(outcomes), skipped=sum(o.status == "skipped" for o in outcomes),
+                        output=str(output), conflicts=conflicts, environment=environment, outcomes=outcomes)
+        result.descriptions = {r.source: record_summary(r) for r in incoming}
+        if business_rules(config):
+            add_mandatory_records(incoming, group_seeds, catalog, config, result)
+            result.descriptions.update({r.source: record_summary(r) for r in incoming})
         progress("Сопоставляю записи матрицы…")
         index = defaultdict(list)
         prom_index = defaultdict(list)
         uncertain = []
         modes = {}
+        matrix_records = {}
         last = config["matrix_header_row"]
         for row in range(last + 1, sheet.max_row + 1):
             # Предзаполненные формулы ниже данных не считаем записями.
@@ -806,6 +1056,10 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
             except ImportProblem as exc:
                 uncertain.append((row, uncertain_constraints(sheet, cols, row, catalog, config), str(exc)))
             else:
+                # Для защитных сравнений не держим ещё одну полную копию
+                # 50 тысяч записей с их описаниями и служебными полями.
+                matrix_records[row] = Record({name: record.values.get(name) for name in
+                                              ("TRANSACTION_TYPE", "MAX_AMOUNT", "STOP_LIST_STATUS")}, record.source)
                 if environment == "PROM":
                     if ift_active:
                         index[record.key(config)].append(row)
@@ -825,6 +1079,8 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
             key = record.key(config)
             values = payload(record, cols, config)
             signature = tuple((k, None if blank(values[k]) else values[k]) for k in MUTABLE_FIELDS)
+            if business_rules(config):
+                signature += tuple((k, norm(record.values.get(k))) for k in ("TRANSACTION_TYPE", "MAX_AMOUNT", "STOP_LIST_STATUS"))
             if key in signatures and signatures[key] != signature:
                 template_conflicts.add(key)
             signatures[key] = signature
@@ -855,6 +1111,45 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                 first = seen[key]
                 add_outcome(result, record.source, "skipped", first.excel_rows, f"Повтор такой же записи в загруженных шаблонах. Первый источник: {first.source}.")
                 continue
+            if business_rules(config):
+                protected = sorted({name for row in [*matches, *prom_matches]
+                                    for name in protected_differences(record, matrix_records[row])})
+                if protected:
+                    add_conflict(result, record.source, "При совпавших группе и стопкоде отличаются " + ", ".join(protected) + ". Ничего не изменено; требуется ручной разбор.", [*matches, *prom_matches])
+                    continue
+                # Один BO_STEP_CODE не может незаметно объединить разные статусы.
+                if any(norm(matrix_records[row].values["STOP_LIST_STATUS"]) != norm(record.values["STOP_LIST_STATUS"]) for row in [*matches, *prom_matches]):
+                    add_conflict(result, record.source, "Одному стопкоду соответствуют разные статусы стоп-листа. Ничего не изменено; требуется ручной разбор.", [*matches, *prom_matches])
+                    continue
+                kind = mandatory_kind(record, catalog)
+                if kind:
+                    if len(matches) > 1:
+                        add_conflict(result, record.source, "Несколько обязательных ИФТ-строк для одной группы. Ничего не изменено; требуется ручной разбор.", matches)
+                        continue
+                    expected = catalog.resolve("VALUE", MANDATORY[kind][1]).code
+                    if norm(record.values["VALUE"]) != norm(expected):
+                        add_conflict(result, record.source, "У обязательной записи задана неверная резолюция. Ничего не изменено; требуется ручной разбор.", matches)
+                        continue
+                    if matches:
+                        row = matches[0]
+                        try:
+                            stored = literal(sheet.cell(row, cols["VALUE"]))
+                            correct = catalog.resolve("VALUE", stored).code == expected
+                        except ImportProblem:
+                            correct = False
+                        if not correct:
+                            add_conflict(result, record.source, "У существующей обязательной ИФТ-строки неверная или непрочитанная резолюция. Требуется ручной разбор.", matches)
+                            continue
+                        if environment == "IFT":
+                            result.skipped += 1
+                            seen[key] = add_outcome(result, record.source, "unchanged", [row], "Обязательная запись уже есть на ИФТ; её резолюция и тексты сохранены.")
+                            continue
+                        # В ПРОМ продвигаем именно сохранённую ИФТ-версию,
+                        # а не перезаписываем её автоматическим текстом.
+                        values.update({name: sheet.cell(row, cols[name]).value for name in MUTABLE_FIELDS})
+                    elif environment == "PROM":
+                        add_conflict(result, record.source, "Нет активной обязательной ИФТ-строки для включения в ПРОМ. Создание строк в задаче ПРОМ запрещено; требуется ручной разбор.", prom_matches)
+                        continue
             if environment == "PROM":
                 current_prom = prom_matches[0] if prom_matches else None
                 ready, unreadable, mismatch_fields = [], [], set()
@@ -924,7 +1219,7 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
             else:
                 last += 1
                 values.update(IFT=1 if environment == "IFT" else None, PROM=1 if environment == "PROM" else None)
-                plans.append(Plan(last, values, prototype=config["prototype_row"]))
+                plans.append(Plan(last, values, prototype=config["prototype_row"], literal_codes=record.values.get("_LITERAL_CODES", ())))
                 result.added += 1
                 seen[key] = add_outcome(result, record.source, "added", [last], "Активная ИФТ-запись с таким ключом отсутствовала; добавлена новая строка.")
         proto = config["prototype_row"]
@@ -937,9 +1232,10 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
                 if any(not blank(c.value) and c.data_type != "f" for c in sheet[row]):
                     raise ImportProblem(f"Строка {row} ниже таблицы содержит данные. Добавление поверх неё остановлено.")
                 for field_name in values:
-                    if field_name not in config["lookups"] and field_name not in ("IFT", "PROM") and sheet.cell(plan.prototype, cols[header(field_name)]).data_type == "f":
+                    primary_descriptions = {config["lookups"][name]["description_field"] for name in CODE_PRIMARY}
+                    if field_name not in config["lookups"] and field_name not in {"IFT", "PROM", *primary_descriptions} and sheet.cell(plan.prototype, cols[header(field_name)]).data_type == "f":
                         raise ImportProblem(f"Образцовая строка {plan.prototype}: входное поле {field_name} содержит формулу.")
-                append_row(sheet, cols, row, plan.prototype, values, config, copy_constants=plan.old_version is not None)
+                append_row(sheet, cols, row, plan.prototype, values, config, copy_constants=plan.old_version is not None, literal_codes=plan.literal_codes)
                 action = "version_added" if plan.old_version is not None else "added"
                 result.changes.append(row_change(sheet, row, action, [], plan.old_version, config["matrix_header_row"]))
             else:
