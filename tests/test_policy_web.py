@@ -16,6 +16,30 @@ class PolicyWebTests(unittest.TestCase):
         web.WebTests.setUp(self)
         self.policy_patch.stop()
 
+    def test_existing_formula_english_code_is_compared_to_template_code_over_http(self):
+        book=load_workbook(self.matrix)
+        try:
+            book['Подсистемы'].append(['SECOND_SP','Демонстрационная подсистема'])
+            book['Типы Операций'].append(['SECOND_OPERATION','Тестовая выдача'])
+            sheet=book.worksheets[0]
+            for row in range(2,6):
+                sheet[f'H{row}']="=INDEX(Подсистемы!A:A,MATCH('Матрица решений комплаенс'!G:G,Подсистемы!B:B,0),1)"
+                sheet[f'P{row}']="=INDEX('Типы Операций'!A:A,MATCH('Матрица решений комплаенс'!O:O,'Типы Операций'!B:B,0),1)"
+            data=io.BytesIO()
+            book.save(data)
+        finally:
+            book.close()
+        matrix=data.getvalue()
+        ident=self.create(matrix=matrix,templates=[self.templates[0].read_bytes()])
+        self.json_request('POST',f'/api/jobs/{ident}/start',{})
+        result=self.wait(ident)
+        self.assertEqual(result['state'],'done',result)
+        self.assertEqual(result['affected_rows'],[])
+        self.assertEqual(result['counts']['conflicted'],0,result)
+        code,saved,_=self.request('GET',result['download_url'])
+        self.assertEqual(code,200)
+        self.assertEqual(saved,matrix)
+
     def test_service_rows_without_reference_entries_work_over_http(self):
         book = load_workbook(self.matrix)
         try:

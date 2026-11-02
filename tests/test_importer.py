@@ -222,6 +222,8 @@ class ImportTests(unittest.TestCase):
             sheet = book.worksheets[0]
             sheet.append([c.value for c in sheet[2]])
             sheet['G6'] = 'Кредитные карты'
+            # Формула новой тестовой строки должна ссылаться именно на G6.
+            sheet['H6'] = "=INDEX('Подсистемы'!$A$2:$A$50,MATCH(G6,'Подсистемы'!$B$2:$B$50,0),1)"
         matrix = self.change(self.matrix, edit, 'cards.xlsx')
         result = self.run_import(matrix=matrix)
         self.assertEqual((result.added, result.updated, result.skipped), (3, 1, 1))
@@ -301,14 +303,13 @@ class ImportTests(unittest.TestCase):
         self.assertEqual((result.added, result.updated, result.skipped), (0, 0, 4))
         self.assertEqual(len(result.conflicts), 1)
 
-    def test_known_code_is_literal_and_uncertain_existing_rows_remain_manual(self):
+    def test_known_code_matches_actual_formula_result_with_shared_russian_name(self):
         matrix = self.change(self.matrix, lambda b: b['Подсистемы'].append(['OTHER_LOAN', 'Демонстрационная подсистема']), 'ambiguous_loan.xlsx')
         result = self.run_import(matrix=matrix)
-        # Новые записи сохраняют английский код. У старых формульных строк
-        # нельзя угадать код по одному общему описанию: они остаются ручными.
-        self.assertEqual((result.added, result.updated, result.skipped), (3, 0, 0))
-        self.assertEqual(len(result.conflicts), 2)
-        self.assertTrue(all('неразобранными строками' in message for message in result.conflicts))
+        # INDEX/MATCH старой строки выбирает DEMO_LOAN — тот же код, что
+        # в шаблоне. Общий русский текст не создаёт неоднозначности ключа.
+        self.assertEqual((result.added, result.updated, result.skipped), (3, 1, 1))
+        self.assertEqual(len(result.conflicts), 0)
         book = load_workbook(self.output)
         try:
             self.assertTrue(all(book.worksheets[0][f'H{row}'].value == 'DEMO_LOAN' for row in (6, 7, 8)))

@@ -17,6 +17,7 @@ from openpyxl.formula.translate import Translator
 from openpyxl.utils.cell import get_column_letter, range_boundaries
 from openpyxl.workbook.properties import CalcProperties
 from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
+from .code_formulas import CodeFormulaError, CodeFormulaReader
 
 ROOT = Path(__file__).resolve().parent.parent
 MUTABLE_FIELDS = ("VALUE", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT")
@@ -177,6 +178,7 @@ class Catalog:
         self.aliases = configured_aliases(config)
         self.cache = {}
         self.step_cache = {}
+        self.code_reader = CodeFormulaReader(book)
 
     def step_code(self, entry):
         if business_rules(self.config) and service_entry(entry.code):
@@ -665,6 +667,8 @@ def read_matrix_row(sheet, cols, row, catalog, config):
                     cell = sheet.cell(row, cols[header(f)])
                     if cell.data_type != "f":
                         raw[f] = literal(cell)
+                    elif field in CODE_PRIMARY and f == field:
+                        raw[f] = matrix_primary_code(cell, catalog)
                     elif field == "TRANSACTION_TYPE" and f == desc:
                         # Формула — не пустая ячейка. Не подменяем её значением по умолчанию.
                         raw[f] = template_value(cell)
@@ -673,11 +677,31 @@ def read_matrix_row(sheet, cols, row, catalog, config):
     return canonical(raw, catalog, config, f"{sheet.title}!{row}", require_payload=False)
 
 
+def matrix_primary_code(cell, catalog):
+    try:
+        code = catalog.code_reader.value(cell)
+        if blank(code):
+            raise CodeFormulaError('формула вернула пустой английский код')
+        return code
+    except CodeFormulaError as exc:
+        raise ImportProblem(f'{cell.parent.title}!{cell.coordinate}: не удалось прочитать английский код: {exc}.') from exc
+
+
 def uncertain_constraints(sheet, cols, row, catalog, config):
     """Возможные ключи неразобранной строки. Ошибка не считается отсутствием записи."""
     constraints = {}
     required = set(config["group_key"] + ["STOP_LIST_STATUS", "MATCH_NEGATIVE_CASE", "INSPECTED_PERSON"])
     for name in dict.fromkeys(config["group_key"] + config["row_key"] + ["SBOL_PRO_PLATFORM"]):
+        if name in CODE_PRIMARY and header(name) in cols:
+            cell = sheet.cell(row, cols[header(name)])
+            if cell.data_type == 'f' or not blank(cell.value):
+                try:
+                    code = matrix_primary_code(cell, catalog)
+                except ImportProblem:
+                    constraints[name] = None
+                else:
+                    constraints[name] = catalog.possible_codes(name, code)
+                continue
         fields = [name]
         if name in config["lookups"]:
             fields.append(config["lookups"][name]["description_field"])
@@ -1294,7 +1318,13 @@ def import_files(matrix, templates, output, config_path=None, progress: Callable
         fd, tmp = tempfile.mkstemp(prefix=".matrix-import-", suffix=".xlsx", dir=output.parent)
         os.close(fd)
         try:
-            book.save(tmp)
+            if plans:
+                book.save(tmp)
+            else:
+                # Без изменений отдаём побайтовую копию исходника: даже
+                # сериализация книги и её неподдерживаемые расширения не затронуты.
+                import shutil
+                shutil.copyfile(matrix, tmp)
             # Эксклюзивное создание не позволяет затереть файл, появившийся за время работы.
             with output.open("xb") as dest, open(tmp, "rb") as src:
                 import shutil

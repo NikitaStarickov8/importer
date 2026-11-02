@@ -75,6 +75,8 @@ class WorkflowTests(unittest.TestCase):
         def edit(book):
             sheet = book.worksheets[0]
             sheet['G2'], sheet['AL2'] = ' demo_loan ', 'ТЗ'
+            # Намеренно неточное описание не влияет на явно сохранённый код.
+            sheet['H2'] = 'DEMO_LOAN'
         matrix = self.change(self.matrix, edit, 'keys.xlsx')
         def change_payload(sheet):
             sheet['L18'], sheet['O18'], sheet['P18'], sheet['Q18'] = 'З', 'Новый заголовок', 'Новый текст', 'произвольный байпас'
