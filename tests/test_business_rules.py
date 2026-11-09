@@ -295,11 +295,12 @@ class BusinessRulesTests(unittest.TestCase):
         self.assertEqual(result.added, 3)
         self.assertEqual(result.skipped, 1)
 
-    def test_non_sbol_platform_does_not_split_group(self):
+    def test_filled_platform_overrides_office_and_splits_sbol_group(self):
         template = self.template([('01 — Тестовое ограничение','З',{'A':'Офис','E':'iPad — тестовая платформа'}),
                                   ('02 — Тестовая проверка','З',{'A':'Офис','E':'Web — тестовая платформа'})])
         result = self.run_import(template)
-        self.assertEqual(result.added, 4)
+        self.assertEqual(result.added, 3)
+        self.assertEqual(self.rows()[-1]['CHANNEL_INDICATOR_DESCRIPTION'], 'СБОЛ про')
 
     def test_legacy_aliases_are_applied_with_business_rules_enabled(self):
         def edit(book):

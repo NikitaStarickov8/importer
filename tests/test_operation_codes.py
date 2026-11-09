@@ -111,7 +111,7 @@ class OperationCodeTests(unittest.TestCase):
     def test_other_lookup_code_description_mismatch_remains_an_error(self):
         def edit(sheet):
             sheet['S16'], sheet['S18'] = 'CHANNEL_INDICATOR', 'SBOL_PRO'
-            sheet['A18'] = 'Офис'
+            sheet['A18'], sheet['E18'] = 'Офис', None
         with self.assertRaisesRegex(ImportProblem, 'CHANNEL_INDICATOR.*не соответствует'):
             self.run_import(self.operation_template(edit=edit))
 

@@ -16,6 +16,44 @@ class PolicyWebTests(unittest.TestCase):
         web.WebTests.setUp(self)
         self.policy_patch.stop()
 
+    def test_different_header_operations_stop_http_import(self):
+        book = load_workbook(self.templates[0])
+        try:
+            book.worksheets[0]['D6'] = 'Другая операция'
+            data = io.BytesIO()
+            book.save(data)
+        finally:
+            book.close()
+        ident = self.create(templates=[data.getvalue()])
+        self.json_request('POST', f'/api/jobs/{ident}/start', {})
+        job = self.wait(ident)
+        self.assertEqual(job['state'], 'error', job)
+        self.assertIn('B6 и D6 указаны разные операции', job['error'])
+        self.assertNotIn('download_url', job)
+
+    def test_platform_overrides_invalid_channel_over_http(self):
+        book = load_workbook(self.templates[1])
+        try:
+            for row in (18, 19):
+                book.worksheets[0][f'A{row}'] = '=BAD_CHANNEL(1)'
+            data = io.BytesIO()
+            book.save(data)
+        finally:
+            book.close()
+        ident = self.create(templates=[data.getvalue()])
+        self.json_request('POST', f'/api/jobs/{ident}/start', {})
+        job = self.wait(ident)
+        self.assertEqual(job['state'], 'done', job)
+        self.assertEqual((job['counts']['added'], job['counts']['conflicted']), (2, 0))
+        code, saved, _ = self.request('GET', job['download_url'])
+        self.assertEqual(code, 200)
+        book = load_workbook(io.BytesIO(saved))
+        try:
+            self.assertEqual(book.worksheets[0]['E6'].value, 'СБОЛ про')
+            self.assertEqual(book.worksheets[0]['E7'].value, 'СБОЛ про')
+        finally:
+            book.close()
+
     def test_existing_formula_english_code_is_compared_to_template_code_over_http(self):
         book=load_workbook(self.matrix)
         try:

@@ -531,6 +531,24 @@ def template_code_primary(sheet, cols, row, catalog, config, name):
     return {}
 
 
+def validate_template_operation(sheet):
+    """Два заполненных названия операции в шапке должны совпадать."""
+    values = {}
+    for address in ("B6", "D6"):
+        try:
+            value = template_value(sheet[address])
+        except ImportProblem:
+            # Прежний fallback на английский код сохраняется, если русскую
+            # формулу прочитать нельзя. Не выдаём её текст за вторую операцию.
+            continue
+        if not blank(value):
+            values[address] = value
+    if len(values) == 2 and norm(values["B6"]) != norm(values["D6"]):
+        raise ImportProblem(f"{sheet.title}: в B6 и D6 указаны разные операции: "
+                            f"B6 = «{values['B6']}», D6 = «{values['D6']}». "
+                            "Исправьте название операции в шаблоне; импорт остановлен.")
+
+
 def parse_template(path, catalog, config, conflicts=None, outcomes=None, group_seeds=None):
     book = load_workbook(path, read_only=False, data_only=False)
     try:
@@ -550,6 +568,7 @@ def parse_template(path, catalog, config, conflicts=None, outcomes=None, group_s
         missing = {"MAX_AMOUNT", "TITLE_FOR_CLIENT", "TEXT_FOR_CLIENT"} - cols.keys()
         if missing:
             raise ImportProblem("В шаблоне отсутствуют столбцы: " + ", ".join(sorted(missing)))
+        validate_template_operation(sheet)
         common = {}
 
         def common_value(field):
@@ -590,8 +609,21 @@ def parse_template(path, catalog, config, conflicts=None, outcomes=None, group_s
         primary_fields = set(CODE_PRIMARY) | {config["lookups"][name]["description_field"] for name in CODE_PRIMARY}
 
         def read_raw(row, fields=None):
+            # Платформа в шаблоне однозначно задаёт канал. Читаем её первой,
+            # чтобы даже ошибочная формула игнорируемого канала не мешала импорту.
+            platform_fields = {"SBOL_PRO_PLATFORM", config["lookups"]["SBOL_PRO_PLATFORM"]["description_field"]}
             raw = {field: template_value(sheet.cell(row, cols[key])) for key, field in known.items()
-                   if key in cols and field not in primary_fields and (fields is None or field in fields)}
+                   if key in cols and field in platform_fields and (fields is None or field in fields)}
+            channel_fields = {"CHANNEL_INDICATOR", config["lookups"]["CHANNEL_INDICATOR"]["description_field"]}
+            has_platform = any(not blank(raw.get(field)) for field in platform_fields)
+            for key, field in known.items():
+                if (key not in cols or field in primary_fields or field in platform_fields
+                        or (fields is not None and field not in fields)
+                        or (has_platform and field in channel_fields)):
+                    continue
+                raw[field] = template_value(sheet.cell(row, cols[key]))
+            if has_platform:
+                raw["CHANNEL_INDICATOR"] = config["platform_channel"]
             for name in CODE_PRIMARY:
                 raw.update(template_code_primary(sheet, cols, row, catalog, config, name))
             return raw

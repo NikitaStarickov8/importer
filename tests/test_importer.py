@@ -187,7 +187,7 @@ class ImportTests(unittest.TestCase):
         def template_edit(book):
             for row in range(18, 21):
                 book.worksheets[0].cell(row, 1, 'Офис')
-                book.worksheets[0].cell(row, 5, 'Web — тестовая платформа')
+                book.worksheets[0].cell(row, 5).value = None
         matrix = self.change(self.matrix, matrix_edit, 'office.xlsx')
         template = self.change(self.templates[0], template_edit, 'office_template.xlsx')
         r = self.run_import(matrix=matrix, templates=[template])
@@ -425,6 +425,7 @@ class ImportTests(unittest.TestCase):
             sheet = book.worksheets[0]
             sheet['D3'], sheet['B3'] = '=B3', '=D3'
             sheet['A18'] = '=D3'
+            sheet['E18'] = None
         template = self.change(self.templates[0], edit, 'cycle.xlsx')
         with self.assertRaisesRegex(ImportProblem, 'циклическая ссылка'):
             self.run_import(templates=[template])
